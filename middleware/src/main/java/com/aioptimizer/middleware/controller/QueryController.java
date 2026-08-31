@@ -67,7 +67,7 @@ public class QueryController {
             ResponseEntity<Map> response = restTemplate.postForEntity(pythonAiUrl, pythonPayload, Map.class);
 
             // 7. Extract the optimized SQL from Python's response
-            String optimizedSql = (String) response.getBody().get("optimized_sql");
+            String optimizedSql = (String) response.getBody().get("optimized_query");
 
             // 8. Run the query and track contention
             QueryTelemetryService.TelemetryResult metrics = queryTelemetryService.executeAndTrack(optimizedSql);

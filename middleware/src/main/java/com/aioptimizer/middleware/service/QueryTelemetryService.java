@@ -15,9 +15,11 @@ public class QueryTelemetryService {
         String contentionQuery = "SELECT count(*) FROM pg_stat_activity WHERE state = 'active';";
         Integer activeConnections = jdbcTemplate.queryForObject(contentionQuery, Integer.class);
 
+        String analyzeSql = "EXPLAIN ANALYZE " + finalSql;
+
         // 2. Execute the AI-optimized query and measure latency
         long startTime = System.currentTimeMillis();
-        jdbcTemplate.execute(finalSql);
+        jdbcTemplate.execute(analyzeSql);
         long endTime = System.currentTimeMillis();
 
         long executionLatency = endTime - startTime;
