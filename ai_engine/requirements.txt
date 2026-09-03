@@ -3,3 +3,4 @@ uvicorn
 pydantic
 torch
 numpy
+psycopg2-binary
