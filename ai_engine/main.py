@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import queryOptimizer
+from routers import queryOptimizer, feedback
 
 app = FastAPI()
 
@@ -17,7 +17,8 @@ app.add_middleware(
 )
 
 app.include_router(queryOptimizer.router)
+app.include_router(feedback.router)
 
 @app.get("/")
 async def health():
-    return {"message":"server is running successfully."}
+    return {"message": "server is running successfully."}
