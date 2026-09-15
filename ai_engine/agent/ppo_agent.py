@@ -1,19 +1,22 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Checkpoint stored at ai_engine/checkpoints/ppo_checkpoint.pt
+_BASE_DIR       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CHECKPOINT_DIR  = os.path.join(_BASE_DIR, "checkpoints")
+CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "ppo_checkpoint.pt")
+
 
 class ExplainableJoinOptimizer(nn.Module):
     """
-    Three-layer network with a built-in attention mechanism.
+    Three-layer neural network with built-in attention (XAI).
 
     Layers:
-      feature_layer  : Linear(input_dim -> hidden_dim)  -- feature extraction
-      attention_layer: Linear(hidden_dim -> 1) + softmax -- XAI weights per table
-      policy_head    : Linear(hidden_dim -> hidden_dim)  -- action logits
-
-    The attention_weights returned are the explainability output:
-    each value is the fraction of the model's "focus" on that table.
+      feature_layer   Linear(input_dim -> hidden_dim)  feature extraction
+      attention_layer Linear(hidden_dim -> 1) + softmax XAI weights per table
+      policy_head     Linear(hidden_dim -> hidden_dim)  action logits
     """
 
     def __init__(self, input_dim: int, hidden_dim: int):
@@ -23,95 +26,65 @@ class ExplainableJoinOptimizer(nn.Module):
         self.policy_head     = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, state_vector: torch.Tensor):
-        features         = F.relu(self.feature_layer(state_vector))    # [N, hidden]
-        attention_scores = self.attention_layer(features)               # [N, 1]
+        features          = F.relu(self.feature_layer(state_vector))   # [N, hidden]
+        attention_scores  = self.attention_layer(features)              # [N, 1]
         attention_weights = F.softmax(attention_scores, dim=0)         # [N, 1]
-        context_vector   = torch.sum(attention_weights * features, dim=0)  # [hidden]
-        action_logits    = self.policy_head(context_vector)             # [hidden]
+        context_vector    = torch.sum(attention_weights * features, dim=0)  # [hidden]
+        action_logits     = self.policy_head(context_vector)           # [hidden]
         return action_logits, attention_weights
 
 
 class PPOTrainer:
     """
-    Policy gradient trainer for ExplainableJoinOptimizer.
+    Policy gradient trainer (REINFORCE with EMA baseline).
 
-    Implements REINFORCE with a running-mean baseline (advantage estimation),
-    gradient norm clipping, and Adam optimisation.  This is the foundation for
-    full PPO; the clipped-ratio surrogate objective can be layered on top once
-    old log-probs are stored alongside each experience.
+    Each train_step():
+      1. Rebuild state tensor from table names (cache hit)
+      2. Update running baseline via EMA
+      3. Compute log-prob of chosen first-join table under current policy
+      4. loss = -log_prob * advantage    (advantage = reward - baseline)
+      5. Clip gradients, step Adam
 
-    Training signal:
-      loss = -log_prob(chosen_first_table) * advantage
-      advantage = reward - running_baseline
-
-    The log-prob is taken over the attention distribution, treating the table
-    chosen as the first join partner as the primary discrete action.
+    Persistence (Part 4):
+      save_checkpoint() -- called after every train_step
+      load_checkpoint() -- called at process startup from trainer_instance.py
     """
 
-    CLIP_EPS      = 0.2    # kept for future ratio-clipping extension
-    GRAD_CLIP     = 0.5    # max gradient norm
-    BASELINE_ALPHA = 0.05  # EMA smoothing factor for running baseline
+    GRAD_CLIP      = 0.5
+    BASELINE_ALPHA = 0.05
 
     def __init__(self, model: ExplainableJoinOptimizer, lr: float = 1e-3):
-        self.model     = model
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        self.baseline  = 0.0   # exponential moving average of rewards
+        self.model       = model
+        self.optimizer   = torch.optim.Adam(model.parameters(), lr=lr)
+        self.baseline    = 0.0
         self.train_count = 0
         self.total_loss  = 0.0
 
     # ------------------------------------------------------------------
-    def _compute_log_prob(self,
-                          state_tensor: torch.Tensor,
-                          chosen_order: list,
-                          tables: list) -> torch.Tensor:
-        """
-        Returns log P(chosen_first_table | state) under the current policy.
-
-        The attention distribution acts as our policy: softmax over tables.
-        We pick the log-prob of whichever table ranked first in chosen_order.
-        """
+    def _compute_log_prob(self, state_tensor, chosen_order, tables):
         _, attention_weights = self.model(state_tensor)
-        probs = attention_weights.squeeze(-1)              # [N_tables]
-        table_to_idx = {t: i for i, t in enumerate(tables)}
-        first_idx = table_to_idx.get(chosen_order[0], 0)
-        log_prob  = torch.log(probs[first_idx] + 1e-8)    # add eps for stability
-        return log_prob
+        probs         = attention_weights.squeeze(-1)
+        table_to_idx  = {t: i for i, t in enumerate(tables)}
+        first_idx     = table_to_idx.get(chosen_order[0], 0)
+        return torch.log(probs[first_idx] + 1e-8)
 
     # ------------------------------------------------------------------
     def train_step(self, experience: dict) -> dict:
-        """
-        One gradient-descent step on a single (state, action, reward) experience.
-
-        Steps:
-          1. Rebuild state tensor from table names (cache hit)
-          2. Update running baseline via EMA
-          3. Compute log-prob of chosen action under current policy
-          4. Compute loss = -log_prob * advantage
-          5. Clip gradients and step Adam
-
-        Returns a metrics dict for logging.
-        """
         from vectorizer.schema_vectorizer import build_state_tensor
 
         tables       = experience["tables"]
         chosen_order = experience["chosen_order"]
         reward       = experience["reward"]
 
-        # 1. State tensor (vectorizer cache keeps this fast)
         state_tensor = build_state_tensor(tables)
 
-        # 2. Update baseline
         self.baseline = ((1.0 - self.BASELINE_ALPHA) * self.baseline
                          + self.BASELINE_ALPHA * reward)
         advantage = reward - self.baseline
 
-        # 3. Current policy log-prob
         log_prob = self._compute_log_prob(state_tensor, chosen_order, tables)
+        loss     = -log_prob * advantage
 
-        # 4. Policy gradient loss (REINFORCE)
-        loss = -log_prob * advantage
-
-        # 5. Gradient update
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.GRAD_CLIP)
@@ -127,7 +100,6 @@ class PPOTrainer:
             "baseline":   round(self.baseline, 4),
             "reward":     round(reward, 4),
         }
-
         print(
             f"[PPO] step={metrics['train_step']}  "
             f"loss={metrics['loss']:.4f}  "
@@ -136,3 +108,50 @@ class PPOTrainer:
             f"reward={metrics['reward']:.1f}"
         )
         return metrics
+
+    # ------------------------------------------------------------------
+    def save_checkpoint(self):
+        """Persist model weights, optimizer state, and trainer scalars to disk."""
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        torch.save({
+            "model_state_dict":     self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "baseline":             self.baseline,
+            "train_count":          self.train_count,
+            "total_loss":           self.total_loss,
+        }, CHECKPOINT_PATH)
+        print(f"[PPO] Checkpoint saved: step={self.train_count}  path={CHECKPOINT_PATH}")
+
+    # ------------------------------------------------------------------
+    def load_checkpoint(self) -> bool:
+        """
+        Load a previously saved checkpoint on startup.
+        Returns True if a checkpoint was found and loaded, False otherwise.
+        """
+        if not os.path.exists(CHECKPOINT_PATH):
+            print("[PPO] No checkpoint found. Starting with fresh weights.")
+            return False
+
+        checkpoint = torch.load(CHECKPOINT_PATH, weights_only=True)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.baseline    = checkpoint.get("baseline",    0.0)
+        self.train_count = checkpoint.get("train_count", 0)
+        self.total_loss  = checkpoint.get("total_loss",  0.0)
+
+        print(
+            f"[PPO] Checkpoint loaded: "
+            f"step={self.train_count}  "
+            f"baseline={self.baseline:.2f}  "
+            f"total_loss={self.total_loss:.4f}"
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    @property
+    def checkpoint_exists(self) -> bool:
+        return os.path.exists(CHECKPOINT_PATH)
+
+    @property
+    def checkpoint_path(self) -> str:
+        return CHECKPOINT_PATH
