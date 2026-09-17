@@ -6,6 +6,7 @@ from models.feedback_model import FeedbackPayload
 from agent.trainer_instance import trainer
 from anomaly.detector_instance import detector
 from anomaly.isolation_forest import get_query_vector, MIN_SAMPLES_TO_FIT, RETRAIN_EVERY_N
+from analytics.analytics_store import complete_record
 
 router = APIRouter()
 CONTENTION_PENALTY = 0.1
@@ -40,6 +41,18 @@ async def receive_feedback(payload: FeedbackPayload):
     train_metrics = trainer.train_step(experience)
     trainer.save_checkpoint()
 
+    # Complete the analytics record (links outcome to the optimize decision)
+    if payload.query_id is not None:
+        complete_record(
+            query_id          = payload.query_id,
+            latency_ms        = payload.latency_ms,
+            active_connections= payload.active_connections,
+            reward            = round(reward, 4),
+            ppo_step          = train_metrics.get("train_step", 0)  if train_metrics else 0,
+            ppo_loss          = train_metrics.get("loss", 0.0)       if train_metrics else 0.0,
+            ppo_baseline      = train_metrics.get("baseline", 0.0)   if train_metrics else 0.0,
+        )
+
     # Forest refit check: trigger at MIN_SAMPLES, then every RETRAIN_EVERY_N
     forest_retrained = False
     if n >= MIN_SAMPLES_TO_FIT and (n == MIN_SAMPLES_TO_FIT or n % RETRAIN_EVERY_N == 0):
@@ -58,7 +71,6 @@ async def receive_feedback(payload: FeedbackPayload):
 
 
 def _extract_vectors(experiences: list) -> list:
-    """Build mean-pooled 10-dim vectors from buffered experiences for forest training."""
     from vectorizer.schema_vectorizer import build_state_tensor
     vectors = []
     for exp in experiences:

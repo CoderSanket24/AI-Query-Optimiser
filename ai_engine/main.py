@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import queryOptimizer, feedback, anomaly_router
+from routers import queryOptimizer, feedback, anomaly_router, analytics_router
 
 app = FastAPI()
 
@@ -15,6 +15,7 @@ app.add_middleware(
 app.include_router(queryOptimizer.router)
 app.include_router(feedback.router)
 app.include_router(anomaly_router.router)
+app.include_router(analytics_router.router)
 
 
 @app.get("/")
