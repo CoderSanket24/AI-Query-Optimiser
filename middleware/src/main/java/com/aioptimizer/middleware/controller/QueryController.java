@@ -54,6 +54,7 @@ public class QueryController {
             System.out.println("4. Firewall passed! Extracting tables...");
             List<String> tables = extractor.extractTables(sql);
 
+            // Step 5: Ask AI engine to optimize
             Map<String, Object> pythonPayload = new HashMap<>();
             pythonPayload.put("tables", tables);
             pythonPayload.put("join_conditions", List.of());
@@ -65,17 +66,26 @@ public class QueryController {
             String optimizedSql = (String) aiResponse.getBody().get("optimized_query");
             List<String> chosenOrder = (List<String>) aiResponse.getBody().get("choosen_order");
 
+            // Extract query_id for analytics linkage (may be null if AI is an older version)
+            Object queryIdObj = aiResponse.getBody().get("query_id");
+            Integer queryId   = (queryIdObj instanceof Number) ? ((Number) queryIdObj).intValue() : null;
+
+            // Step 6: Execute optimised SQL and measure latency
             QueryTelemetryService.TelemetryResult metrics = queryTelemetryService.executeAndTrack(optimizedSql);
 
             System.out.println("Execution Time: " + metrics.latencyMs + "ms");
             System.out.println("Active Server Connections: " + metrics.activeConnections);
 
+            // Step 7: Send feedback (in fire-and-forget try/catch so it never breaks query delivery)
             try {
                 Map<String, Object> feedbackPayload = new HashMap<>();
                 feedbackPayload.put("tables",             tables);
                 feedbackPayload.put("chosen_order",       chosenOrder);
                 feedbackPayload.put("latency_ms",         (double) metrics.latencyMs);
                 feedbackPayload.put("active_connections", metrics.activeConnections);
+                if (queryId != null) {
+                    feedbackPayload.put("query_id", queryId);   // links outcome to analytics record
+                }
 
                 String feedbackUrl = "http://localhost:8000/feedback";
                 ResponseEntity<Map> feedbackResponse = restTemplate.postForEntity(feedbackUrl, feedbackPayload, Map.class);
@@ -88,6 +98,7 @@ public class QueryController {
                 System.out.println("Warning: Feedback to AI engine failed: " + feedbackEx.getMessage());
             }
 
+            // Step 8: Return enriched response
             Map<String, Object> finalResponse = new HashMap<>(aiResponse.getBody());
             finalResponse.put("latency_ms",         metrics.latencyMs);
             finalResponse.put("active_connections", metrics.activeConnections);
