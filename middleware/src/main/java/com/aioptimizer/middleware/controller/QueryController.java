@@ -54,7 +54,7 @@ public class QueryController {
             System.out.println("4. Firewall passed! Extracting tables...");
             List<String> tables = extractor.extractTables(sql);
 
-            // Step 5: Ask AI engine to optimize
+            // Step 5: Ask AI engine to optimise
             Map<String, Object> pythonPayload = new HashMap<>();
             pythonPayload.put("tables", tables);
             pythonPayload.put("join_conditions", List.of());
@@ -63,42 +63,45 @@ public class QueryController {
             String pythonAiUrl = "http://localhost:8000/optimize";
             ResponseEntity<Map> aiResponse = restTemplate.postForEntity(pythonAiUrl, pythonPayload, Map.class);
 
-            String optimizedSql = (String) aiResponse.getBody().get("optimized_query");
+            String optimizedSql  = (String) aiResponse.getBody().get("optimized_query");
             List<String> chosenOrder = (List<String>) aiResponse.getBody().get("choosen_order");
 
-            // Extract query_id for analytics linkage (may be null if AI is an older version)
-            Object queryIdObj = aiResponse.getBody().get("query_id");
-            Integer queryId   = (queryIdObj instanceof Number) ? ((Number) queryIdObj).intValue() : null;
+            // Extract query_id and log_prob_old for analytics + PPO batch (Part 6 & 7)
+            Object queryIdObj     = aiResponse.getBody().get("query_id");
+            Object logProbOldObj  = aiResponse.getBody().get("log_prob_old");
+            Integer queryId       = (queryIdObj    instanceof Number) ? ((Number) queryIdObj).intValue()    : null;
+            Double  logProbOld    = (logProbOldObj instanceof Number) ? ((Number) logProbOldObj).doubleValue() : null;
 
             // Step 6: Execute optimised SQL and measure latency
             QueryTelemetryService.TelemetryResult metrics = queryTelemetryService.executeAndTrack(optimizedSql);
-
             System.out.println("Execution Time: " + metrics.latencyMs + "ms");
             System.out.println("Active Server Connections: " + metrics.activeConnections);
 
-            // Step 7: Send feedback (in fire-and-forget try/catch so it never breaks query delivery)
+            // Step 7: Send feedback (fire-and-forget — never breaks query delivery)
             try {
                 Map<String, Object> feedbackPayload = new HashMap<>();
                 feedbackPayload.put("tables",             tables);
                 feedbackPayload.put("chosen_order",       chosenOrder);
                 feedbackPayload.put("latency_ms",         (double) metrics.latencyMs);
                 feedbackPayload.put("active_connections", metrics.activeConnections);
-                if (queryId != null) {
-                    feedbackPayload.put("query_id", queryId);   // links outcome to analytics record
-                }
+                if (queryId    != null) feedbackPayload.put("query_id",     queryId);
+                if (logProbOld != null) feedbackPayload.put("log_prob_old", logProbOld);  // Part 7
 
                 String feedbackUrl = "http://localhost:8000/feedback";
                 ResponseEntity<Map> feedbackResponse = restTemplate.postForEntity(feedbackUrl, feedbackPayload, Map.class);
 
                 double reward     = ((Number) feedbackResponse.getBody().get("reward")).doubleValue();
                 int    bufferSize = (int)     feedbackResponse.getBody().get("buffer_size");
-                System.out.println("PPO Reward: " + reward + " | Replay Buffer: " + bufferSize + "/1000");
+                Object batchFired = feedbackResponse.getBody().get("ppo_batch_fired");
+                System.out.println("PPO Reward: " + reward
+                    + " | Buffer: " + bufferSize + "/1000"
+                    + " | BatchFired: " + batchFired);
 
             } catch (Exception feedbackEx) {
                 System.out.println("Warning: Feedback to AI engine failed: " + feedbackEx.getMessage());
             }
 
-            // Step 8: Return enriched response
+            // Step 8: Return enriched response to caller
             Map<String, Object> finalResponse = new HashMap<>(aiResponse.getBody());
             finalResponse.put("latency_ms",         metrics.latencyMs);
             finalResponse.put("active_connections", metrics.activeConnections);
