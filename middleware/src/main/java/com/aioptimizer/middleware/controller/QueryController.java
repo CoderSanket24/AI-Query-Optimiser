@@ -42,19 +42,21 @@ public class QueryController {
             }
 
             String sql = payload.get("query");
-            System.out.println("2. Extracted SQL String: " + sql);
+            System.out.println("2. Extracted SQL: " + sql);
 
             if (sql == null || sql.trim().isEmpty()) {
-                return ResponseEntity.badRequest().body("ERROR: The SQL query cannot be empty.");
+                return ResponseEntity.badRequest().body("ERROR: SQL query cannot be empty.");
             }
 
+            // Step 3: Firewall check
             System.out.println("3. Sending to Firewall...");
             astFirewall.inspectQuery(sql);
 
+            // Step 4: Extract tables
             System.out.println("4. Firewall passed! Extracting tables...");
             List<String> tables = extractor.extractTables(sql);
 
-            // Step 5: Ask AI engine to optimise
+            // Step 5: Ask AI engine to optimise join order
             Map<String, Object> pythonPayload = new HashMap<>();
             pythonPayload.put("tables", tables);
             pythonPayload.put("join_conditions", List.of());
@@ -63,48 +65,57 @@ public class QueryController {
             String pythonAiUrl = "http://localhost:8000/optimize";
             ResponseEntity<Map> aiResponse = restTemplate.postForEntity(pythonAiUrl, pythonPayload, Map.class);
 
-            String optimizedSql  = (String) aiResponse.getBody().get("optimized_query");
-            List<String> chosenOrder = (List<String>) aiResponse.getBody().get("choosen_order");
+            String       optimizedSql = (String)       aiResponse.getBody().get("optimized_query");
+            List<String> chosenOrder  = (List<String>) aiResponse.getBody().get("choosen_order");
 
-            // Extract query_id and log_prob_old for analytics + PPO batch (Part 6 & 7)
-            Object queryIdObj     = aiResponse.getBody().get("query_id");
-            Object logProbOldObj  = aiResponse.getBody().get("log_prob_old");
-            Integer queryId       = (queryIdObj    instanceof Number) ? ((Number) queryIdObj).intValue()    : null;
-            Double  logProbOld    = (logProbOldObj instanceof Number) ? ((Number) logProbOldObj).doubleValue() : null;
+            // Extract query_id and log_prob_old for analytics + PPO batch
+            Object queryIdObj    = aiResponse.getBody().get("query_id");
+            Object logProbOldObj = aiResponse.getBody().get("log_prob_old");
+            Integer queryId      = (queryIdObj    instanceof Number) ? ((Number) queryIdObj).intValue()    : null;
+            Double  logProbOld   = (logProbOldObj instanceof Number) ? ((Number) logProbOldObj).doubleValue() : null;
 
-            // Step 6: Execute optimised SQL and measure latency
+            // Step 6: Execute query — measures wait_time_ms AND exec_time_ms separately
             QueryTelemetryService.TelemetryResult metrics = queryTelemetryService.executeAndTrack(optimizedSql);
-            System.out.println("Execution Time: " + metrics.latencyMs + "ms");
-            System.out.println("Active Server Connections: " + metrics.activeConnections);
 
-            // Step 7: Send feedback (fire-and-forget — never breaks query delivery)
+            System.out.println("Wait Time:    " + metrics.waitTimeMs + " ms");
+            System.out.println("Exec Time:    " + metrics.execTimeMs + " ms");
+            System.out.println("Total:        " + metrics.latencyMs  + " ms");
+            System.out.println("Connections:  " + metrics.activeConnections);
+
+            // Step 7: Send feedback with full telemetry (Isolation Forest + PPO reward)
             try {
                 Map<String, Object> feedbackPayload = new HashMap<>();
                 feedbackPayload.put("tables",             tables);
                 feedbackPayload.put("chosen_order",       chosenOrder);
                 feedbackPayload.put("latency_ms",         (double) metrics.latencyMs);
+                feedbackPayload.put("exec_time_ms",       (double) metrics.execTimeMs);   // PPO reward
+                feedbackPayload.put("wait_time_ms",       (double) metrics.waitTimeMs);   // Anomaly detection
                 feedbackPayload.put("active_connections", metrics.activeConnections);
                 if (queryId    != null) feedbackPayload.put("query_id",     queryId);
-                if (logProbOld != null) feedbackPayload.put("log_prob_old", logProbOld);  // Part 7
+                if (logProbOld != null) feedbackPayload.put("log_prob_old", logProbOld);
 
                 String feedbackUrl = "http://localhost:8000/feedback";
                 ResponseEntity<Map> feedbackResponse = restTemplate.postForEntity(feedbackUrl, feedbackPayload, Map.class);
 
-                double reward     = ((Number) feedbackResponse.getBody().get("reward")).doubleValue();
-                int    bufferSize = (int)     feedbackResponse.getBody().get("buffer_size");
+                Object reward     = feedbackResponse.getBody().get("reward");
+                Object bufferSize = feedbackResponse.getBody().get("buffer_size");
                 Object batchFired = feedbackResponse.getBody().get("ppo_batch_fired");
+                Object anomalyDet = feedbackResponse.getBody().get("anomaly_detected");
                 System.out.println("PPO Reward: " + reward
                     + " | Buffer: " + bufferSize + "/1000"
-                    + " | BatchFired: " + batchFired);
+                    + " | BatchFired: " + batchFired
+                    + " | AnomalyDetected: " + anomalyDet);
 
             } catch (Exception feedbackEx) {
-                System.out.println("Warning: Feedback to AI engine failed: " + feedbackEx.getMessage());
+                System.out.println("Warning: Feedback failed: " + feedbackEx.getMessage());
             }
 
-            // Step 8: Return enriched response to caller
+            // Step 8: Return enriched response
             Map<String, Object> finalResponse = new HashMap<>(aiResponse.getBody());
             finalResponse.put("latency_ms",         metrics.latencyMs);
-            finalResponse.put("active_connections", metrics.activeConnections);
+            finalResponse.put("exec_time_ms",        metrics.execTimeMs);
+            finalResponse.put("wait_time_ms",        metrics.waitTimeMs);
+            finalResponse.put("active_connections",  metrics.activeConnections);
 
             return ResponseEntity.ok(finalResponse);
 
