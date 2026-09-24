@@ -5,7 +5,14 @@ from typing import List, Optional
 class FeedbackPayload(BaseModel):
     tables:             List[str]
     chosen_order:       List[str]
-    latency_ms:         float
+
+    # Timing (split by QueryTelemetryService.java)
+    latency_ms:         float           # total = wait + exec (kept for compatibility)
+    exec_time_ms:       float = 0.0     # actual PostgreSQL execution → PPO reward signal
+    wait_time_ms:       float = 0.0     # HikariCP pool wait       → Isolation Forest signal
+
     active_connections: int
-    query_id:           Optional[int]   = None   # links to analytics record
-    log_prob_old:       Optional[float] = None   # log π_old for PPO ratio (Part 7)
+
+    # Analytics + PPO linkage
+    query_id:           Optional[int]   = None
+    log_prob_old:       Optional[float] = None
