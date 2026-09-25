@@ -9,7 +9,7 @@ If no checkpoint exists, starts with fresh random weights.
 
 from agent.ppo_agent import ExplainableJoinOptimizer, PPOTrainer
 
-_model  = ExplainableJoinOptimizer(input_dim=10, hidden_dim=32)
+_model  = ExplainableJoinOptimizer(input_dim=11, hidden_dim=32)
 trainer = PPOTrainer(model=_model, lr=1e-3)
 
 # Resume learning from last session if a checkpoint exists
