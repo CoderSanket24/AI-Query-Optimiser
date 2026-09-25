@@ -82,7 +82,7 @@ async def receive_feedback(payload: FeedbackPayload):
         }
         ppo_batch_fired  = False
 
-        # Update analytics with anomaly flag
+        # Update analytics — mark as anomalous so history table is accurate
         if payload.query_id is not None:
             complete_record(
                 query_id           = payload.query_id,
@@ -92,6 +92,8 @@ async def receive_feedback(payload: FeedbackPayload):
                 ppo_step           = trainer.train_count,
                 ppo_loss           = 0.0,
                 ppo_baseline       = trainer.baseline,
+                is_anomalous       = True,          # ← DoS detected
+                anomaly_score      = anomaly_score, # ← Forest score
             )
 
         # Still accumulate this sample for forest self-improvement
@@ -183,6 +185,8 @@ async def receive_feedback(payload: FeedbackPayload):
             ppo_step           = train_metrics.get("train_step", trainer.train_count),
             ppo_loss           = train_metrics.get("loss", train_metrics.get("avg_loss", 0.0)),
             ppo_baseline       = train_metrics.get("baseline", trainer.baseline),
+            is_anomalous       = False,          # confirmed normal by forest
+            anomaly_score      = anomaly_score,  # forest score (positive = normal)
         )
 
     # ── Step 5: Forest refit ─────────────────────────────────────────

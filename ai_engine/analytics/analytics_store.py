@@ -52,6 +52,8 @@ def complete_record(
     ppo_step:          int   = 0,
     ppo_loss:          float = 0.0,
     ppo_baseline:      float = 0.0,
+    is_anomalous:      bool  = False,   # ← set True when DoS detected in /feedback
+    anomaly_score:     float = 0.0,     # ← Isolation Forest score at feedback time
 ) -> None:
     """Fill in the outcome fields for an existing record."""
     with _lock:
@@ -63,6 +65,8 @@ def complete_record(
                 rec.ppo_step            = ppo_step
                 rec.ppo_loss            = ppo_loss
                 rec.ppo_baseline        = ppo_baseline
+                rec.is_anomalous        = is_anomalous    # update from feedback
+                rec.anomaly_score       = anomaly_score   # update from feedback
                 return
 
 
