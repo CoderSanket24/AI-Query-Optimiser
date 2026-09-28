@@ -3,9 +3,11 @@ anomaly_router.py
 -----------------
 GET /anomaly/status  -- Isolation Forest state and configuration.
 
-Reflects the redesigned Part 5 v2:
-  Forest now trained on [wait_time_ms, exec_time_ms, active_connections]
-  to detect DoS patterns (high latency with low active connections).
+Reflects the redesigned Part 5 v3:
+  Forest trained on [wait_time_ms, active_connections]  (2D, exec_time EXCLUDED)
+  exec_time excluded because it can be high due to PPO's own bad join order --
+  including it would falsely flag legitimate PPO learning as DoS.
+  Detection works via victim pattern: high wait + low connections.
   Applied AFTER execution in /feedback, not before in /optimize.
 """
 
@@ -36,8 +38,10 @@ async def anomaly_status():
         "min_samples_to_fit": MIN_SAMPLES_TO_FIT,
         "retrain_every_n":    RETRAIN_EVERY_N,
 
-        # Design info
-        "feature_vector":     ["wait_time_ms", "exec_time_ms", "active_connections"],
+        # Design info (v3)
+        "feature_vector":     ["wait_time_ms", "active_connections"],
+        "exec_time_excluded": "yes -- exec can be high due to PPO bad join order, not DoS",
+        "detection_pattern":  "high wait_time + LOW connections = DoS victim pattern",
         "placement":          "post-execution in /feedback (not pre-query in /optimize)",
         "anomaly_action":     "reward=0, PPO training skipped (DoS protection)",
         "normal_reward":      "reward = -exec_time_ms / (1 + connections * 0.1)",

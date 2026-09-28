@@ -5,10 +5,12 @@ POST /feedback
   Receives per-query telemetry after execution.
 
   Step 1 — Isolation Forest anomaly check (DoS detection):
-    Features: [wait_time_ms, exec_time_ms, active_connections]
-    Normal:   high wait + high connections  (legitimate DB load)
-    Anomaly:  high exec  + low connections  (hacker's slow query)
-              high wait  + low connections  (victims behind DoS)
+    Features: [wait_time_ms, active_connections]   (exec_time EXCLUDED)
+    Normal:   low wait + any connections    (queries going through fine)
+              high wait + high connections  (legitimate DB load)
+    Anomaly:  high wait + LOW connections   (victims waiting behind DoS)
+    Note: exec_time excluded -- it can be high due to PPO's own bad join
+          order, which would falsely block PPO from learning.
 
     If ANOMALY:
       reward = 0.0               ← neutralise, PPO learns NOTHING
@@ -63,7 +65,6 @@ async def receive_feedback(payload: FeedbackPayload):
     # ── Step 1: Isolation Forest anomaly check ──────────────────────
     is_anomaly, anomaly_score = detector.predict(
         wait_time_ms       = wait_ms,
-        exec_time_ms       = exec_ms,
         active_connections = payload.active_connections,
     )
 
@@ -97,7 +98,7 @@ async def receive_feedback(payload: FeedbackPayload):
             )
 
         # Still accumulate this sample for forest self-improvement
-        _accumulate_forest_sample(wait_ms, exec_ms, payload.active_connections)
+        _accumulate_forest_sample(wait_ms, payload.active_connections)
 
         return {
             "status":           "received",
@@ -191,7 +192,7 @@ async def receive_feedback(payload: FeedbackPayload):
 
     # ── Step 5: Forest refit ─────────────────────────────────────────
     forest_retrained = _accumulate_forest_sample(
-        wait_ms, exec_ms, payload.active_connections)
+        wait_ms, payload.active_connections)
 
     return {
         "status":           "received",
@@ -208,14 +209,15 @@ async def receive_feedback(payload: FeedbackPayload):
 
 
 def _accumulate_forest_sample(wait_ms: float,
-                               exec_ms: float,
                                connections: int) -> bool:
     """
-    Add one [wait_ms, exec_ms, connections] sample to the forest buffer.
+    Add one [wait_ms, connections] sample to the forest buffer.
+    exec_ms deliberately excluded -- cannot be a DoS signal since
+    exec_time can be high due to PPO's own suboptimal join order.
     Triggers refit when MIN_SAMPLES_TO_FIT reached, then every RETRAIN_EVERY_N.
     Returns True if forest was retrained.
     """
-    sample = [wait_ms, exec_ms, float(connections)]
+    sample = [wait_ms, float(connections)]
     with _forest_lock:
         _forest_samples.append(sample)
         n       = len(_forest_samples)
