@@ -155,7 +155,7 @@ function Dashboard() {
 
       {ppo && (
         <div className="cards-grid">
-          <div className="card blue">
+          <div className="card teal">
             <div className="card-label">PPO Train Steps</div>
             <div className="card-value">{ppo.train_steps?.toLocaleString()}</div>
             <div className="card-sub">Neural network updates</div>
@@ -192,7 +192,7 @@ function Dashboard() {
             <div className="card-label">Anomalies Caught</div>
             <div className="card-value">{summary.total_anomalies ?? '-'}</div>
           </div>
-          <div className="card blue">
+          <div className="card teal">
             <div className="card-label">Avg Latency</div>
             <div className="card-value">{summary.avg_latency_ms?.toFixed(1) ?? '-'} ms</div>
           </div>
@@ -205,11 +205,11 @@ function Dashboard() {
           <div className="chart-wrap">
             <ResponsiveContainer width="100%" height={260}>
               <LineChart data={chartData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                <XAxis dataKey="index" stroke="#475569" tick={{ fontSize: 11 }} label={{ value: 'Query #', position: 'insideBottom', offset: -2, fill: '#475569', fontSize: 11 }} />
-                <YAxis stroke="#475569" tick={{ fontSize: 11 }} />
-                <Tooltip contentStyle={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 8 }} labelStyle={{ color: '#94a3b8' }} itemStyle={{ color: '#60a5fa' }} />
-                <Line type="monotone" dataKey="reward" stroke="#3b82f6" strokeWidth={2} dot={false} name="Reward" />
+                <CartesianGrid strokeDasharray="3 3" stroke="#dcfce7" />
+                <XAxis dataKey="index" stroke="#6aaa7e" tick={{ fontSize: 11 }} label={{ value: 'Query #', position: 'insideBottom', offset: -2, fill: '#6aaa7e', fontSize: 11 }} />
+                <YAxis stroke="#6aaa7e" tick={{ fontSize: 11 }} />
+                <Tooltip contentStyle={{ background: '#ffffff', border: '1px solid #bbf7d0', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.08)' }} labelStyle={{ color: '#6aaa7e' }} itemStyle={{ color: '#16a34a' }} />
+                <Line type="monotone" dataKey="reward" stroke="#16a34a" strokeWidth={2.5} dot={false} name="Reward" />
               </LineChart>
             </ResponsiveContainer>
           </div>
