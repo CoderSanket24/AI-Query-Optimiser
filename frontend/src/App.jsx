@@ -1,39 +1,33 @@
 import { useState, useEffect, useCallback } from 'react'
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, BarChart, Bar, Legend
+  ResponsiveContainer
 } from 'recharts'
 import {
   executeQuery, fetchSummary, fetchHistory,
-  fetchRewards, fetchPpoStats, fetchAnomalyStatus
+  fetchPpoStats, fetchAnomalyStatus
 } from './api/api'
 import './App.css'
 
-// ── Pill colours for join order ────────────────────────────────────────
 const PILL_CLASSES = ['pill-1', 'pill-2', 'pill-3', 'pill-4']
 
 // ─────────────────────────────────────────────────────────────────────
 // Tab: Query Runner
 // ─────────────────────────────────────────────────────────────────────
 function QueryRunner() {
-  const [sql, setSql]       = useState("SELECT t.title, n.name FROM title t JOIN cast_info ci ON t.id=ci.movie_id JOIN name n ON ci.person_id=n.id WHERE t.production_year=2000 LIMIT 10")
-  const [result, setResult] = useState(null)
+  const [sql, setSql]         = useState("SELECT t.title, n.name FROM title t JOIN cast_info ci ON t.id=ci.movie_id JOIN name n ON ci.person_id=n.id WHERE t.production_year=2000 LIMIT 10")
+  const [result, setResult]   = useState(null)
   const [loading, setLoading] = useState(false)
-  const [error, setError]   = useState(null)
+  const [error, setError]     = useState(null)
 
   const run = async () => {
     setLoading(true); setError(null); setResult(null)
-    try {
-      const data = await executeQuery(sql)
-      setResult(data)
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setLoading(false)
-    }
+    try   { setResult(await executeQuery(sql)) }
+    catch (e) { setError(e.message) }
+    finally   { setLoading(false) }
   }
 
-  const xai = result?.xai_explanation || {}
+  const xai    = result?.xai_explanation || {}
   const maxAttn = Math.max(...Object.values(xai), 1)
 
   return (
@@ -58,23 +52,10 @@ function QueryRunner() {
           <h2>AI Optimization Result</h2>
           <div className="result-box">
             <h3>Execution Metrics</h3>
-
-            <div className="result-row">
-              <span className="label">Exec Time</span>
-              <span className="value">{result.exec_time_ms} ms</span>
-            </div>
-            <div className="result-row">
-              <span className="label">Wait Time</span>
-              <span className="value">{result.wait_time_ms} ms</span>
-            </div>
-            <div className="result-row">
-              <span className="label">Total Latency</span>
-              <span className="value">{result.latency_ms} ms</span>
-            </div>
-            <div className="result-row">
-              <span className="label">Active Connections</span>
-              <span className="value">{result.active_connections}</span>
-            </div>
+            <div className="result-row"><span className="label">Exec Time</span><span className="value">{result.exec_time_ms} ms</span></div>
+            <div className="result-row"><span className="label">Wait Time</span><span className="value">{result.wait_time_ms} ms</span></div>
+            <div className="result-row"><span className="label">Total Latency</span><span className="value">{result.latency_ms} ms</span></div>
+            <div className="result-row"><span className="label">Active Connections</span><span className="value">{result.active_connections}</span></div>
             <div className="result-row">
               <span className="label">Anomaly Detected</span>
               <span className={`anomaly-badge ${result.anomaly_detected ? 'anomaly-true' : 'anomaly-false'}`}>
@@ -82,7 +63,7 @@ function QueryRunner() {
               </span>
             </div>
 
-            <h3 style={{ marginTop: 20, marginBottom: 12 }}>AI Join Order (XAI)</h3>
+            <h3 style={{ marginTop: 20, marginBottom: 12 }}>AI Join Order (XAI Attention)</h3>
             <div className="result-row">
               <span className="label">Chosen Order</span>
               <div className="order-pills">
@@ -94,10 +75,7 @@ function QueryRunner() {
             <div style={{ marginTop: 16 }}>
               {Object.entries(xai).sort(([, a], [, b]) => b - a).map(([table, pct]) => (
                 <div className="attention-bar-row" key={table}>
-                  <div className="attention-label">
-                    <span>{table}</span>
-                    <span>{pct}%</span>
-                  </div>
+                  <div className="attention-label"><span>{table}</span><span>{pct}%</span></div>
                   <div className="attention-bar-bg">
                     <div className="attention-bar-fill" style={{ width: `${(pct / maxAttn) * 100}%` }} />
                   </div>
@@ -106,7 +84,7 @@ function QueryRunner() {
             </div>
 
             <h3 style={{ marginTop: 20, marginBottom: 8 }}>Optimized SQL</h3>
-            <pre style={{ background: '#0f172a', padding: 12, borderRadius: 6, fontSize: '0.78rem', color: '#a5f3fc', overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+            <pre style={{ background: '#f0fdf4', padding: 12, borderRadius: 8, fontSize: '0.78rem', color: '#15803d', overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all', border: '1px solid #bbf7d0' }}>
               {result.optimized_query}
             </pre>
           </div>
@@ -117,24 +95,32 @@ function QueryRunner() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Tab: Dashboard (summary cards + reward chart)
+// Tab: Dashboard
 // ─────────────────────────────────────────────────────────────────────
 function Dashboard() {
-  const [summary,  setSummary]  = useState(null)
-  const [rewards,  setRewards]  = useState([])
-  const [ppo,      setPpo]      = useState(null)
-  const [loading,  setLoading]  = useState(true)
+  const [summary, setSummary] = useState(null)
+  const [points,  setPoints]  = useState([])
+  const [ppo,     setPpo]     = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error,   setError]   = useState(null)
 
   const load = useCallback(async () => {
-    setLoading(true)
+    setLoading(true); setError(null)
     try {
-      const [s, r, p] = await Promise.all([fetchSummary(), fetchRewards(), fetchPpoStats()])
+      // FastAPI routes:
+      //   /analytics/summary     -> { total_queries, latency:{avg_ms}, reward:{avg}, anomalous_queries }
+      //   /analytics/improvement -> { points:[{query_id, reward, ...}] }
+      //   /feedback/stats        -> { train_steps, baseline, buffer_size, forest_samples }
+      const [s, imp, p] = await Promise.all([
+        fetchSummary(),
+        fetch('/api/analytics/improvement?n=50').then(r => r.json()),
+        fetchPpoStats(),
+      ])
       setSummary(s)
-      // recharts expects array; rewards may be {rewards:[...]} or [...]
-      setRewards(Array.isArray(r) ? r : (r.rewards || []))
+      setPoints(imp.points || [])
       setPpo(p)
     } catch (e) {
-      console.error(e)
+      setError(e.message)
     } finally {
       setLoading(false)
     }
@@ -142,16 +128,13 @@ function Dashboard() {
 
   useEffect(() => { load() }, [load])
 
-  const chartData = rewards.slice(-50).map((r, i) => ({
-    index: i + 1,
-    reward: typeof r === 'object' ? r.reward : r,
-  }))
+  const chartData = points.map(r => ({ id: r.query_id, reward: r.reward }))
 
   return (
     <div>
-      <button className="refresh-btn" onClick={load}>Refresh</button>
-
-      {loading && <p style={{ color: '#64748b' }}><span className="spinner" />Loading dashboard...</p>}
+      <button className="refresh-btn" onClick={load}>↻ Refresh</button>
+      {loading && <p style={{ color: '#6aaa7e' }}><span className="spinner" />Loading...</p>}
+      {error   && <p style={{ color: '#dc2626', marginBottom: 16 }}>Failed to load: {error}</p>}
 
       {ppo && (
         <div className="cards-grid">
@@ -161,7 +144,7 @@ function Dashboard() {
             <div className="card-sub">Neural network updates</div>
           </div>
           <div className="card green">
-            <div className="card-label">Avg Reward (Baseline)</div>
+            <div className="card-label">Baseline Reward</div>
             <div className="card-value">{ppo.baseline?.toFixed(1)}</div>
             <div className="card-sub">Higher = faster queries</div>
           </div>
@@ -173,42 +156,52 @@ function Dashboard() {
           <div className="card">
             <div className="card-label">Forest Samples</div>
             <div className="card-value">{ppo.forest_samples}</div>
-            <div className="card-sub">Isolation Forest trained on</div>
+            <div className="card-sub">Isolation Forest</div>
           </div>
         </div>
       )}
 
-      {summary && (
+      {summary && summary.total_queries > 0 && (
         <div className="cards-grid">
           <div className="card">
             <div className="card-label">Total Queries</div>
-            <div className="card-value">{summary.total_queries ?? '-'}</div>
+            <div className="card-value">{summary.total_queries}</div>
           </div>
           <div className="card green">
-            <div className="card-label">Avg Exec Time</div>
-            <div className="card-value">{summary.avg_exec_time_ms?.toFixed(1) ?? '-'} ms</div>
+            <div className="card-label">Avg Latency</div>
+            <div className="card-value">{summary.latency?.avg_ms ?? '-'} ms</div>
           </div>
           <div className="card red">
             <div className="card-label">Anomalies Caught</div>
-            <div className="card-value">{summary.total_anomalies ?? '-'}</div>
+            <div className="card-value">{summary.anomalous_queries ?? 0}</div>
           </div>
           <div className="card teal">
-            <div className="card-label">Avg Latency</div>
-            <div className="card-value">{summary.avg_latency_ms?.toFixed(1) ?? '-'} ms</div>
+            <div className="card-label">Avg Reward</div>
+            <div className="card-value">{summary.reward?.avg?.toFixed(1) ?? '-'}</div>
           </div>
+        </div>
+      )}
+
+      {summary && summary.total_queries === 0 && !loading && (
+        <div className="section" style={{ color: '#6aaa7e', textAlign: 'center', padding: 40 }}>
+          No queries recorded yet — go to Query Runner and run some queries!
         </div>
       )}
 
       {chartData.length > 0 && (
         <div className="section">
-          <h2>PPO Reward Learning Curve (last 50 queries)</h2>
+          <h2>PPO Reward Learning Curve</h2>
           <div className="chart-wrap">
-            <ResponsiveContainer width="100%" height={260}>
-              <LineChart data={chartData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
+            <ResponsiveContainer width="100%" height={280}>
+              <LineChart data={chartData} margin={{ top: 5, right: 20, left: 0, bottom: 20 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#dcfce7" />
-                <XAxis dataKey="index" stroke="#6aaa7e" tick={{ fontSize: 11 }} label={{ value: 'Query #', position: 'insideBottom', offset: -2, fill: '#6aaa7e', fontSize: 11 }} />
+                <XAxis dataKey="id" stroke="#6aaa7e" tick={{ fontSize: 11 }} label={{ value: 'Query ID', position: 'insideBottom', offset: -10, fill: '#6aaa7e', fontSize: 11 }} />
                 <YAxis stroke="#6aaa7e" tick={{ fontSize: 11 }} />
-                <Tooltip contentStyle={{ background: '#ffffff', border: '1px solid #bbf7d0', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.08)' }} labelStyle={{ color: '#6aaa7e' }} itemStyle={{ color: '#16a34a' }} />
+                <Tooltip
+                  contentStyle={{ background: '#ffffff', border: '1px solid #bbf7d0', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.08)' }}
+                  labelStyle={{ color: '#6aaa7e' }}
+                  itemStyle={{ color: '#16a34a' }}
+                />
                 <Line type="monotone" dataKey="reward" stroke="#16a34a" strokeWidth={2.5} dot={false} name="Reward" />
               </LineChart>
             </ResponsiveContainer>
@@ -220,7 +213,7 @@ function Dashboard() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Tab: History Table
+// Tab: History
 // ─────────────────────────────────────────────────────────────────────
 function HistoryTab() {
   const [records, setRecords] = useState([])
@@ -229,8 +222,9 @@ function HistoryTab() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
+      // /analytics/history returns { total, limit, offset, records:[...] }
       const data = await fetchHistory()
-      setRecords(Array.isArray(data) ? data : (data.records || []))
+      setRecords(data.records || [])
     } catch (e) { console.error(e) }
     finally { setLoading(false) }
   }, [])
@@ -240,23 +234,18 @@ function HistoryTab() {
   return (
     <div className="section">
       <h2>Query History</h2>
-      <button className="refresh-btn" onClick={load}>Refresh</button>
-      {loading && <p style={{ color: '#64748b' }}><span className="spinner" />Loading...</p>}
+      <button className="refresh-btn" onClick={load}>↻ Refresh</button>
+      {loading && <p style={{ color: '#6aaa7e' }}><span className="spinner" />Loading...</p>}
       <div style={{ overflowX: 'auto' }}>
         <table className="history-table">
           <thead>
             <tr>
-              <th>ID</th>
-              <th>Tables</th>
-              <th>Exec (ms)</th>
-              <th>Wait (ms)</th>
-              <th>Reward</th>
-              <th>PPO Step</th>
-              <th>Anomaly</th>
+              <th>ID</th><th>Tables</th><th>Exec (ms)</th>
+              <th>Wait (ms)</th><th>Reward</th><th>PPO Step</th><th>Anomaly</th>
             </tr>
           </thead>
           <tbody>
-            {records.slice().reverse().map((r, i) => (
+            {[...records].reverse().map((r, i) => (
               <tr key={i}>
                 <td>{r.query_id ?? '-'}</td>
                 <td style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -264,7 +253,7 @@ function HistoryTab() {
                 </td>
                 <td>{r.exec_time_ms ?? '-'}</td>
                 <td>{r.wait_time_ms ?? '-'}</td>
-                <td style={{ fontFamily: 'monospace', color: (r.reward ?? 0) < -500 ? '#f87171' : '#4ade80' }}>
+                <td style={{ fontFamily: 'monospace', color: (r.reward ?? 0) < -500 ? '#dc2626' : '#16a34a', fontWeight: 600 }}>
                   {r.reward?.toFixed(2) ?? '-'}
                 </td>
                 <td>{r.ppo_step ?? '-'}</td>
@@ -275,7 +264,7 @@ function HistoryTab() {
               </tr>
             ))}
             {records.length === 0 && !loading && (
-              <tr><td colSpan={7} style={{ color: '#475569', textAlign: 'center', padding: 24 }}>No records yet — run some queries!</td></tr>
+              <tr><td colSpan={7} style={{ color: '#6aaa7e', textAlign: 'center', padding: 32 }}>No records yet — run some queries!</td></tr>
             )}
           </tbody>
         </table>
@@ -285,7 +274,7 @@ function HistoryTab() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Tab: Anomaly / Isolation Forest Status
+// Tab: Anomaly / Isolation Forest
 // ─────────────────────────────────────────────────────────────────────
 function AnomalyTab() {
   const [status,  setStatus]  = useState(null)
@@ -302,8 +291,8 @@ function AnomalyTab() {
 
   return (
     <div>
-      <button className="refresh-btn" onClick={load}>Refresh</button>
-      {loading && <p style={{ color: '#64748b' }}><span className="spinner" />Loading...</p>}
+      <button className="refresh-btn" onClick={load}>↻ Refresh</button>
+      {loading && <p style={{ color: '#6aaa7e' }}><span className="spinner" />Loading...</p>}
       {status && (
         <>
           <div className="cards-grid" style={{ marginBottom: 24 }}>
@@ -312,7 +301,7 @@ function AnomalyTab() {
               <div className="card-value">{status.is_fitted ? 'FITTED' : 'NOT FITTED'}</div>
               <div className="card-sub">Isolation Forest</div>
             </div>
-            <div className="card blue">
+            <div className="card teal">
               <div className="card-label">Samples Trained On</div>
               <div className="card-value">{status.n_samples_trained}</div>
             </div>
@@ -331,14 +320,21 @@ function AnomalyTab() {
           <div className="section">
             <h2>Isolation Forest Configuration</h2>
             <div className="status-grid">
-              <div className="status-item"><div className="s-label">Feature Vector</div><div className="s-value">{JSON.stringify(status.feature_vector)}</div></div>
-              <div className="status-item"><div className="s-label">exec_time Excluded</div><div className="s-value" style={{ color: '#4ade80' }}>{status.exec_time_excluded}</div></div>
-              <div className="status-item"><div className="s-label">Detection Pattern</div><div className="s-value">{status.detection_pattern}</div></div>
-              <div className="status-item"><div className="s-label">Anomaly Action</div><div className="s-value">{status.anomaly_action}</div></div>
-              <div className="status-item"><div className="s-label">Min Samples to Fit</div><div className="s-value">{status.min_samples_to_fit}</div></div>
-              <div className="status-item"><div className="s-label">Retrain Every N</div><div className="s-value">{status.retrain_every_n}</div></div>
-              <div className="status-item"><div className="s-label">Placement</div><div className="s-value">{status.placement}</div></div>
-              <div className="status-item"><div className="s-label">Normal Reward Formula</div><div className="s-value">{status.normal_reward}</div></div>
+              {[
+                ['Feature Vector',      JSON.stringify(status.feature_vector)],
+                ['exec_time Excluded',  status.exec_time_excluded],
+                ['Detection Pattern',   status.detection_pattern],
+                ['Anomaly Action',      status.anomaly_action],
+                ['Min Samples to Fit',  status.min_samples_to_fit],
+                ['Retrain Every N',     status.retrain_every_n],
+                ['Placement',           status.placement],
+                ['Normal Reward',       status.normal_reward],
+              ].map(([label, val]) => (
+                <div className="status-item" key={label}>
+                  <div className="s-label">{label}</div>
+                  <div className="s-value">{val}</div>
+                </div>
+              ))}
             </div>
           </div>
         </>
@@ -354,7 +350,6 @@ const TABS = ['Query Runner', 'Dashboard', 'History', 'Security (Forest)']
 
 export default function App() {
   const [activeTab, setActiveTab] = useState(0)
-
   return (
     <div className="app">
       <div className="header">
@@ -362,21 +357,13 @@ export default function App() {
           <h1>AI Query Optimizer</h1>
           <p>PPO Reinforcement Learning + Isolation Forest DoS Protection</p>
         </div>
-        <span className="badge">Live</span>
+        <span className="badge">● Live</span>
       </div>
-
       <div className="tabs">
         {TABS.map((t, i) => (
-          <button
-            key={t}
-            className={`tab-btn ${activeTab === i ? 'active' : ''}`}
-            onClick={() => setActiveTab(i)}
-          >
-            {t}
-          </button>
+          <button key={t} className={`tab-btn ${activeTab === i ? 'active' : ''}`} onClick={() => setActiveTab(i)}>{t}</button>
         ))}
       </div>
-
       {activeTab === 0 && <QueryRunner />}
       {activeTab === 1 && <Dashboard />}
       {activeTab === 2 && <HistoryTab />}

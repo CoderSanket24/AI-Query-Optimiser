@@ -31,9 +31,9 @@ export const fetchHistory = async () => {
   return res.json();
 };
 
-export const fetchRewards = async () => {
-  const res = await fetch(`${BASE}/analytics/rewards`);
-  if (!res.ok) throw new Error('Failed to fetch rewards');
+export const fetchImprovement = async (n = 50) => {
+  const res = await fetch(`${BASE}/analytics/improvement?n=${n}`);
+  if (!res.ok) throw new Error('Failed to fetch improvement data');
   return res.json();
 };
 
