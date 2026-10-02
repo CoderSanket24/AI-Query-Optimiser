@@ -67,5 +67,5 @@ async def optimize_query(state: QueryState):
         "choosen_order":   optimized_order,
         "xai_explanation": xai_explanation,
         "query_id":        rec.query_id,
-        "log_prob_old":    round(log_prob_old, 6),
+        # "log_prob_old":    round(log_prob_old, 6),
     }
