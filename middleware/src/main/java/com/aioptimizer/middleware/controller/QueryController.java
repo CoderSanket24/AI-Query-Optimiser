@@ -88,8 +88,8 @@ public class QueryController {
                 feedbackPayload.put("tables",             tables);
                 feedbackPayload.put("chosen_order",       chosenOrder);
                 feedbackPayload.put("latency_ms",         (double) metrics.latencyMs);
-                feedbackPayload.put("exec_time_ms",       (double) metrics.execTimeMs);   // PPO reward
-                feedbackPayload.put("wait_time_ms",       (double) metrics.waitTimeMs);   // Anomaly detection
+                feedbackPayload.put("exec_time_ms",       (double) metrics.execTimeMs);
+                feedbackPayload.put("wait_time_ms",       (double) metrics.waitTimeMs);
                 feedbackPayload.put("active_connections", metrics.activeConnections);
                 if (queryId    != null) feedbackPayload.put("query_id",     queryId);
                 if (logProbOld != null) feedbackPayload.put("log_prob_old", logProbOld);
