@@ -1,18 +1,12 @@
 import { useState, useEffect, useCallback } from 'react'
-import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer
-} from 'recharts'
-import {
-  executeQuery, fetchSummary, fetchHistory,
-  fetchPpoStats, fetchAnomalyStatus
-} from './api/api'
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
+import { executeQuery, fetchSummary, fetchHistory, fetchPpoStats, fetchAnomalyStatus } from './api/api'
 import './App.css'
 
 const PILL_CLASSES = ['pill-1', 'pill-2', 'pill-3', 'pill-4']
 
 // ─────────────────────────────────────────────────────────────────────
-// Tab: Query Runner
+// Tab: Query Runner  (two-column layout)
 // ─────────────────────────────────────────────────────────────────────
 function QueryRunner() {
   const [sql, setSql]         = useState("SELECT t.title, n.name FROM title t JOIN cast_info ci ON t.id=ci.movie_id JOIN name n ON ci.person_id=n.id WHERE t.production_year=2000 LIMIT 10")
@@ -27,12 +21,14 @@ function QueryRunner() {
     finally   { setLoading(false) }
   }
 
-  const xai    = result?.xai_explanation || {}
+  const xai     = result?.xai_explanation || {}
   const maxAttn = Math.max(...Object.values(xai), 1)
 
   return (
-    <div>
-      <div className="section">
+    <div className="runner-grid">
+
+      {/* ── LEFT: Query Input Panel ── */}
+      <div className="section runner-left">
         <h2>Run a Query</h2>
         <textarea
           className="query-input"
@@ -42,54 +38,78 @@ function QueryRunner() {
         />
         <button className="run-btn" onClick={run} disabled={loading}>
           {loading && <span className="spinner" />}
-          {loading ? 'Optimizing...' : 'Run Query'}
+          {loading ? 'Optimizing...' : '▶  Run Query'}
         </button>
         {error && <div className="error-msg">Error: {error}</div>}
+
+        <div className="sample-label">Quick Sample Queries</div>
+        {[
+          ["3-Table Join",  "SELECT t.title, n.name FROM title t JOIN cast_info ci ON t.id=ci.movie_id JOIN name n ON ci.person_id=n.id WHERE t.production_year=2000 LIMIT 10"],
+          ["Keyword Join",  "SELECT t.title, k.keyword FROM title t JOIN movie_keyword mk ON t.id=mk.movie_id JOIN keyword k ON mk.keyword_id=k.id WHERE t.production_year=2005 LIMIT 10"],
+          ["Company Join",  "SELECT t.title, cn.name FROM title t JOIN movie_companies mc ON t.id=mc.movie_id JOIN company_name cn ON mc.company_id=cn.id WHERE t.production_year=2010 LIMIT 10"],
+        ].map(([label, q]) => (
+          <button key={label} className="sample-btn" onClick={() => setSql(q)}>{label}</button>
+        ))}
       </div>
 
-      {result && (
-        <div className="section">
-          <h2>AI Optimization Result</h2>
+      {/* ── RIGHT: Result Panel ── */}
+      <div className="section runner-right">
+        <h2>AI Optimization Result</h2>
+
+        {!result && !loading && !error && (
+          <div className="empty-result">
+            <div className="empty-icon">⚡</div>
+            <p>Run a query on the left to see the AI optimization result here.</p>
+          </div>
+        )}
+
+        {loading && (
+          <div className="empty-result">
+            <span className="spinner" style={{ width: 32, height: 32, borderWidth: 3 }} />
+            <p style={{ marginTop: 16, color: '#6aaa7e' }}>AI is optimizing your query...</p>
+          </div>
+        )}
+
+        {error && <div className="error-msg">Error: {error}</div>}
+
+        {result && (
           <div className="result-box">
             <h3>Execution Metrics</h3>
             <div className="result-row"><span className="label">Exec Time</span><span className="value">{result.exec_time_ms} ms</span></div>
             <div className="result-row"><span className="label">Wait Time</span><span className="value">{result.wait_time_ms} ms</span></div>
             <div className="result-row"><span className="label">Total Latency</span><span className="value">{result.latency_ms} ms</span></div>
-            <div className="result-row"><span className="label">Active Connections</span><span className="value">{result.active_connections}</span></div>
+            <div className="result-row"><span className="label">Connections</span><span className="value">{result.active_connections}</span></div>
             <div className="result-row">
-              <span className="label">Anomaly Detected</span>
+              <span className="label">Anomaly</span>
               <span className={`anomaly-badge ${result.anomaly_detected ? 'anomaly-true' : 'anomaly-false'}`}>
-                {result.anomaly_detected ? 'YES — DoS Pattern' : 'NO — Normal'}
+                {result.anomaly_detected ? '🚨 DoS Detected' : '✅ Normal'}
               </span>
             </div>
 
-            <h3 style={{ marginTop: 20, marginBottom: 12 }}>AI Join Order (XAI Attention)</h3>
-            <div className="result-row">
-              <span className="label">Chosen Order</span>
+            <h3 style={{ marginTop: 20, marginBottom: 10 }}>XAI — Attention Weights</h3>
+            <div className="result-row" style={{ marginBottom: 12 }}>
+              <span className="label">Join Order</span>
               <div className="order-pills">
                 {(result.choosen_order || []).map((t, i) => (
                   <span key={t} className={`pill ${PILL_CLASSES[i % 4]}`}>{i + 1}. {t}</span>
                 ))}
               </div>
             </div>
-            <div style={{ marginTop: 16 }}>
-              {Object.entries(xai).sort(([, a], [, b]) => b - a).map(([table, pct]) => (
-                <div className="attention-bar-row" key={table}>
-                  <div className="attention-label"><span>{table}</span><span>{pct}%</span></div>
-                  <div className="attention-bar-bg">
-                    <div className="attention-bar-fill" style={{ width: `${(pct / maxAttn) * 100}%` }} />
-                  </div>
+            {Object.entries(xai).sort(([, a], [, b]) => b - a).map(([table, pct]) => (
+              <div className="attention-bar-row" key={table}>
+                <div className="attention-label"><span>{table}</span><span>{pct}%</span></div>
+                <div className="attention-bar-bg">
+                  <div className="attention-bar-fill" style={{ width: `${(pct / maxAttn) * 100}%` }} />
                 </div>
-              ))}
-            </div>
+              </div>
+            ))}
 
             <h3 style={{ marginTop: 20, marginBottom: 8 }}>Optimized SQL</h3>
-            <pre style={{ background: '#f0fdf4', padding: 12, borderRadius: 8, fontSize: '0.78rem', color: '#15803d', overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all', border: '1px solid #bbf7d0' }}>
-              {result.optimized_query}
-            </pre>
+            <pre className="sql-pre">{result.optimized_query}</pre>
           </div>
-        </div>
-      )}
+        )}
+      </div>
+
     </div>
   )
 }
@@ -107,10 +127,6 @@ function Dashboard() {
   const load = useCallback(async () => {
     setLoading(true); setError(null)
     try {
-      // FastAPI routes:
-      //   /analytics/summary     -> { total_queries, latency:{avg_ms}, reward:{avg}, anomalous_queries }
-      //   /analytics/improvement -> { points:[{query_id, reward, ...}] }
-      //   /feedback/stats        -> { train_steps, baseline, buffer_size, forest_samples }
       const [s, imp, p] = await Promise.all([
         fetchSummary(),
         fetch('/api/analytics/improvement?n=50').then(r => r.json()),
@@ -197,11 +213,7 @@ function Dashboard() {
                 <CartesianGrid strokeDasharray="3 3" stroke="#dcfce7" />
                 <XAxis dataKey="id" stroke="#6aaa7e" tick={{ fontSize: 11 }} label={{ value: 'Query ID', position: 'insideBottom', offset: -10, fill: '#6aaa7e', fontSize: 11 }} />
                 <YAxis stroke="#6aaa7e" tick={{ fontSize: 11 }} />
-                <Tooltip
-                  contentStyle={{ background: '#ffffff', border: '1px solid #bbf7d0', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.08)' }}
-                  labelStyle={{ color: '#6aaa7e' }}
-                  itemStyle={{ color: '#16a34a' }}
-                />
+                <Tooltip contentStyle={{ background: '#ffffff', border: '1px solid #bbf7d0', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.08)' }} labelStyle={{ color: '#6aaa7e' }} itemStyle={{ color: '#16a34a' }} />
                 <Line type="monotone" dataKey="reward" stroke="#16a34a" strokeWidth={2.5} dot={false} name="Reward" />
               </LineChart>
             </ResponsiveContainer>
@@ -222,7 +234,6 @@ function HistoryTab() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      // /analytics/history returns { total, limit, offset, records:[...] }
       const data = await fetchHistory()
       setRecords(data.records || [])
     } catch (e) { console.error(e) }
@@ -321,14 +332,14 @@ function AnomalyTab() {
             <h2>Isolation Forest Configuration</h2>
             <div className="status-grid">
               {[
-                ['Feature Vector',      JSON.stringify(status.feature_vector)],
-                ['exec_time Excluded',  status.exec_time_excluded],
-                ['Detection Pattern',   status.detection_pattern],
-                ['Anomaly Action',      status.anomaly_action],
-                ['Min Samples to Fit',  status.min_samples_to_fit],
-                ['Retrain Every N',     status.retrain_every_n],
-                ['Placement',           status.placement],
-                ['Normal Reward',       status.normal_reward],
+                ['Feature Vector',     JSON.stringify(status.feature_vector)],
+                ['exec_time Excluded', status.exec_time_excluded],
+                ['Detection Pattern',  status.detection_pattern],
+                ['Anomaly Action',     status.anomaly_action],
+                ['Min Samples to Fit', status.min_samples_to_fit],
+                ['Retrain Every N',    status.retrain_every_n],
+                ['Placement',          status.placement],
+                ['Normal Reward',      status.normal_reward],
               ].map(([label, val]) => (
                 <div className="status-item" key={label}>
                   <div className="s-label">{label}</div>
