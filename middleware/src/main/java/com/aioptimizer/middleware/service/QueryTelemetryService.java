@@ -7,12 +7,11 @@ import org.springframework.stereotype.Service;
 import javax.sql.DataSource;
 import java.sql.Connection;
 import java.sql.Statement;
-import java.sql.ResultSet;
 
 /**
  * QueryTelemetryService
  * ----------------------
- * Measures three separate timing metrics for every query execution:
+ * Measures three separate timing metrics for every query execution.
  *
  *   wait_time_ms  -- time to acquire a JDBC connection from HikariCP pool.
  *                    High wait + low connections = DB under DoS stress.
@@ -20,19 +19,21 @@ import java.sql.ResultSet;
  *   exec_time_ms  -- time PostgreSQL spends actually running the query
  *                    (total_wall_time - wait_time).
  *                    This is what the PPO join order affects.
+ *                    Uses System.nanoTime() so fast queries do NOT round to 0.
  *
  *   latency_ms    -- total wall-clock time (wait + exec), kept for compatibility.
  *
  * active_connections -- current number of active sessions in pg_stat_activity.
  *
- * Isolation Forest (FastAPI) uses [wait_time_ms, exec_time_ms, active_connections]
- * to detect DoS patterns (high wait or exec with low connections).
- *
- * PPO reward uses exec_time_ms only, since join order only affects execution,
- * not connection pool wait.
+ * IMPORTANT: exec_time_ms is -1 when timing is genuinely unavailable (should
+ * never happen in practice). feedback.py treats -1 as "missing" and falls back
+ * to REINFORCE rather than silently leaking wait_time into the reward.
  */
 @Service
 public class QueryTelemetryService {
+
+    /** Sentinel: exec time could not be measured (not zero, which is valid). */
+    public static final long EXEC_TIME_MISSING = -1L;
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
@@ -48,20 +49,23 @@ public class QueryTelemetryService {
         Integer activeConnections =
             jdbcTemplate.queryForObject(contentionQuery, Integer.class);
 
-        // 2. Measure wait_time: time to acquire connection from HikariCP pool
-        long waitStart = System.currentTimeMillis();
+        // 2. Measure wait_time: time to acquire connection from HikariCP pool.
+        //    Use nanoTime for sub-millisecond precision — fast pools return in
+        //    microseconds and currentTimeMillis rounds to 0.
+        long waitStart = System.nanoTime();
         Connection conn = dataSource.getConnection();
-        long waitTimeMs = System.currentTimeMillis() - waitStart;
+        long waitTimeMs = (System.nanoTime() - waitStart) / 1_000_000L;
 
-        // 3. Measure exec_time: time PostgreSQL spends running the query
-        long execStart = System.currentTimeMillis();
+        // 3. Measure exec_time: time PostgreSQL spends running the query.
+        //    Also uses nanoTime so short analytical queries are not reported as 0.
+        long execStart = System.nanoTime();
+        long execTimeMs;
         try (Statement stmt = conn.createStatement()) {
-            // Use EXPLAIN ANALYZE to get real execution stats without returning rows
             stmt.execute("EXPLAIN ANALYZE " + finalSql);
+            execTimeMs = (System.nanoTime() - execStart) / 1_000_000L;
         } finally {
             conn.close();   // return connection to pool
         }
-        long execTimeMs = System.currentTimeMillis() - execStart;
 
         long latencyMs = waitTimeMs + execTimeMs;
 
@@ -76,7 +80,7 @@ public class QueryTelemetryService {
     // ── Result holder ──────────────────────────────────────────────────────────
     public static class TelemetryResult {
         public long latencyMs;      // total  = wait + exec
-        public long execTimeMs;     // PPO reward signal  (join order affects this)
+        public long execTimeMs;     // PPO reward signal  (join order affects this); -1 = missing
         public long waitTimeMs;     // Isolation Forest signal (DoS detection)
         public int  activeConnections;
 
