@@ -16,15 +16,25 @@ POST /feedback
       reward = 0.0               ← neutralise, PPO learns NOTHING
       PPO training skipped       ← protects RL from poisoned signal
       analytics record updated   ← marked is_anomalous=True
+      flagged sample QUARANTINED ← NOT fed back to forest to prevent
+                                   the detector from learning attacks are normal
       log warning
 
     If NORMAL:
       reward = -exec_time_ms / (1 + connections × 0.1)
                ← exec_time only (join order does NOT affect wait_time)
+               ← exec_time_ms == EXEC_MISSING (-1) → REINFORCE fallback,
+                  reward not computed (fast-query timing gap)
       PPO batch accumulation     ← train when batch_size=8 reached
 
-  Step 2 — Forest refit (every MIN_SAMPLES / RETRAIN_EVERY_N samples).
+  Step 2 — Forest refit (every MIN_SAMPLES / RETRAIN_EVERY_N NORMAL samples).
   Step 3 — Checkpoint save (after every PPO batch update).
+
+  PPO path (Bug 3 fix):
+    log_prob_old is read from the server-side pending store (pop_pending),
+    NOT from the HTTP payload.  The client never sees or sends log_prob_old,
+    so it cannot be tampered with.  The payload field `log_prob_old` has been
+    removed; the condition now only checks query_id.
 
 GET /feedback/stats   -- PPO + buffer + checkpoint state
 GET /feedback/buffer  -- raw replay buffer (debug)
@@ -46,21 +56,33 @@ router = APIRouter()
 CONTENTION_PENALTY = 0.1
 BATCH_SIZE         = 8
 
+# Sentinel value: exec_time could not be measured (nanoTime path was skipped).
+# Distinct from 0 ms which is a valid measurement for extremely fast queries.
+EXEC_MISSING = -1.0
+
 _replay_buffer: deque = deque(maxlen=1000)
 _buffer_lock          = threading.Lock()
 
 _ppo_batch:     list  = []
 _ppo_batch_lock       = threading.Lock()
 
-# Accumulate telemetry samples for forest refit
+# Normal-query-only samples for forest refit.
+# Anomalous samples are QUARANTINED — never added here.
 _forest_samples: list = []
 _forest_lock          = threading.Lock()
 
 
 @router.post("/feedback")
 async def receive_feedback(payload: FeedbackPayload):
-    exec_ms = payload.exec_time_ms if payload.exec_time_ms > 0 else payload.latency_ms
+    # ── exec_ms resolution ───────────────────────────────────────────
+    # exec_time_ms == EXEC_MISSING (-1) means the Java side could not measure it
+    # (should be rare with nanoTime, but guard anyway).
+    # We do NOT fall back to latency_ms because that includes wait_time,
+    # which the join order cannot affect.
+    exec_ms = payload.exec_time_ms   # may be EXEC_MISSING
     wait_ms = payload.wait_time_ms
+
+    exec_is_missing = (exec_ms == EXEC_MISSING)
 
     # ── Step 1: Isolation Forest anomaly check ──────────────────────
     is_anomaly, anomaly_score = detector.predict(
@@ -69,19 +91,19 @@ async def receive_feedback(payload: FeedbackPayload):
     )
 
     if is_anomaly:
-        # DoS / bad query detected — zero reward, skip PPO
+        # DoS / bad query detected — zero reward, skip PPO.
         reward = 0.0
         print(
             f"[ANOMALY] DoS detected! "
-            f"wait={wait_ms:.0f}ms  exec={exec_ms:.0f}ms  "
+            f"wait={wait_ms:.0f}ms  exec={'?' if exec_is_missing else f'{exec_ms:.0f}ms'}  "
             f"conn={payload.active_connections}  score={anomaly_score}"
         )
-        train_metrics    = {
+        train_metrics   = {
             "mode":          "skipped_anomaly",
             "reason":        "DoS pattern detected by Isolation Forest",
             "anomaly_score": anomaly_score,
         }
-        ppo_batch_fired  = False
+        ppo_batch_fired = False
 
         # Update analytics — mark as anomalous so history table is accurate
         if payload.query_id is not None:
@@ -97,8 +119,8 @@ async def receive_feedback(payload: FeedbackPayload):
                 anomaly_score      = anomaly_score, # ← Forest score
             )
 
-        # Still accumulate this sample for forest self-improvement
-        _accumulate_forest_sample(wait_ms, payload.active_connections)
+        # QUARANTINE: do NOT add flagged samples to _forest_samples.
+        # Feeding anomalies back would teach the forest that attacks are normal.
 
         return {
             "status":           "received",
@@ -112,42 +134,64 @@ async def receive_feedback(payload: FeedbackPayload):
         }
 
     # ── Step 2: Normal query — compute reward using exec_time only ───
-    # Join order affects exec_time, NOT wait_time → use exec_time for reward
-    contention_factor = 1.0 + (payload.active_connections * CONTENTION_PENALTY)
-    reward = -(exec_ms / contention_factor)
+    # Join order affects exec_time, NOT wait_time.
+    if exec_is_missing:
+        # Can't compute a valid reward — record the experience but skip PPO.
+        reward = None
+        print(
+            f"[Feedback] exec_time missing (nanoTime sentinel) — "
+            f"wait={wait_ms:.0f}ms  conn={payload.active_connections}  "
+            f"→ REINFORCE skipped, no reward computed"
+        )
+    else:
+        contention_factor = 1.0 + (payload.active_connections * CONTENTION_PENALTY)
+        reward = -(exec_ms / contention_factor)
 
     experience = {
         "tables":             payload.tables,
+        "stat_names":         payload.real_names if payload.real_names else payload.tables,
         "chosen_order":       payload.chosen_order,
         "latency_ms":         payload.latency_ms,
         "exec_time_ms":       exec_ms,
         "wait_time_ms":       wait_ms,
         "active_connections": payload.active_connections,
-        "reward":             round(reward, 4),
+        "reward":             round(reward, 4) if reward is not None else None,
     }
 
-    with _buffer_lock:
-        _replay_buffer.append(experience)
-        buf_snapshot = list(_replay_buffer)
-    n = len(buf_snapshot)
+    if reward is not None:
+        with _buffer_lock:
+            _replay_buffer.append(experience)
+            buf_snapshot = list(_replay_buffer)
+        n = len(buf_snapshot)
 
-    print(
-        f"[Feedback] order={payload.chosen_order} | "
-        f"wait={wait_ms:.0f}ms exec={exec_ms:.0f}ms | "
-        f"reward={reward:.2f} | buffer={n}/1000"
-    )
+        print(
+            f"[Feedback] order={payload.chosen_order} | "
+            f"wait={wait_ms:.0f}ms exec={exec_ms:.0f}ms | "
+            f"reward={reward:.2f} | buffer={n}/1000"
+        )
+    else:
+        with _buffer_lock:
+            n = len(_replay_buffer)
 
     # ── Step 3: PPO training ─────────────────────────────────────────
     train_metrics   = {}
     ppo_batch_fired = False
 
-    if payload.log_prob_old is not None and payload.query_id is not None:
+    if reward is None:
+        # Missing exec_time → cannot compute a valid reward; skip training.
+        train_metrics = {"mode": "skipped_missing_exec", "reason": "exec_time_ms sentinel (-1)"}
+
+    elif payload.query_id is not None:
+        # Read log_prob_old from SERVER-SIDE pending store (not from payload).
+        # This prevents client tampering and fixes the PPO-never-runs bug:
+        # the value was previously commented out of the /optimize response.
         pending = pop_pending(payload.query_id)
         if pending is not None:
             ppo_exp = {
                 "state_tensor": pending["state_tensor"],
-                "first_idx":    pending["first_idx"],
-                "log_prob_old": payload.log_prob_old,
+                "aliases":      pending["aliases"],
+                "chosen_order": payload.chosen_order,
+                "log_prob_old": pending["log_prob_old"],   # ← from server store
                 "reward":       round(reward, 4),
             }
             with _ppo_batch_lock:
@@ -170,6 +214,7 @@ async def receive_feedback(payload: FeedbackPayload):
                     "batch_size": BATCH_SIZE,
                 }
         else:
+            # Pending entry expired or was never created → REINFORCE fallback
             train_metrics = trainer.train_step(experience)
             trainer.save_checkpoint()
     else:
@@ -182,7 +227,7 @@ async def receive_feedback(payload: FeedbackPayload):
             query_id           = payload.query_id,
             latency_ms         = payload.latency_ms,
             active_connections = payload.active_connections,
-            reward             = round(reward, 4),
+            reward             = round(reward, 4) if reward is not None else 0.0,
             ppo_step           = train_metrics.get("train_step", trainer.train_count),
             ppo_loss           = train_metrics.get("loss", train_metrics.get("avg_loss", 0.0)),
             ppo_baseline       = train_metrics.get("baseline", trainer.baseline),
@@ -190,15 +235,14 @@ async def receive_feedback(payload: FeedbackPayload):
             anomaly_score      = anomaly_score,  # forest score (positive = normal)
         )
 
-    # ── Step 5: Forest refit ─────────────────────────────────────────
-    forest_retrained = _accumulate_forest_sample(
-        wait_ms, payload.active_connections)
+    # ── Step 5: Forest refit (normal samples only) ───────────────────
+    forest_retrained = _accumulate_forest_sample(wait_ms, payload.active_connections)
 
     return {
         "status":           "received",
         "anomaly_detected": False,
         "anomaly_score":    anomaly_score,
-        "reward":           round(reward, 4),
+        "reward":           round(reward, 4) if reward is not None else None,
         "exec_time_ms":     exec_ms,
         "wait_time_ms":     wait_ms,
         "buffer_size":      n,
@@ -212,7 +256,8 @@ def _accumulate_forest_sample(wait_ms: float,
                                connections: int) -> bool:
     """
     Add one [wait_ms, connections] sample to the forest buffer.
-    exec_ms deliberately excluded -- cannot be a DoS signal since
+    Only NORMAL (non-anomalous) samples reach this function.
+    exec_ms deliberately excluded — cannot be a DoS signal since
     exec_time can be high due to PPO's own suboptimal join order.
     Triggers refit when MIN_SAMPLES_TO_FIT reached, then every RETRAIN_EVERY_N.
     Returns True if forest was retrained.

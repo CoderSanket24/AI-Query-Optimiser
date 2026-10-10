@@ -2,6 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Categorical
 
 _BASE_DIR       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHECKPOINT_DIR  = os.path.join(_BASE_DIR, "checkpoints")
@@ -14,7 +15,24 @@ class ExplainableJoinOptimizer(nn.Module):
 
       feature_layer   Linear(input_dim -> hidden_dim)  feature extraction
       attention_layer Linear(hidden_dim -> 1) + softmax  XAI weights per table
-      policy_head     Linear(hidden_dim -> hidden_dim)  action logits
+      policy_head     Linear(hidden_dim -> hidden_dim)  unused in action selection
+                      (kept for architecture compatibility; future: value head)
+
+    Action space
+    ------------
+    A join order is a permutation of the N table aliases.  We model this as
+    sampling WITHOUT replacement from a Categorical distribution:
+
+      1. Run forward pass → attention_weights [N]  (probabilities over tables)
+      2. Sample table i₁ ~ Categorical(attention_weights)
+      3. Zero out i₁, renormalise → sample i₂, repeat.
+
+    The log-probability of the full permutation is the sum of the per-step
+    log-probs — analogous to pointer-network action log-probs used in
+    neural combinatorial optimisation.
+
+    This makes PPO's probability ratio r = π_new(a|s) / π_old(a|s) meaningful:
+    both π_old and π_new are computed over the same full sequence.
     """
 
     def __init__(self, input_dim: int, hidden_dim: int):
@@ -29,7 +47,7 @@ class ExplainableJoinOptimizer(nn.Module):
         attention_weights = F.softmax(attention_scores, dim=0)             # [N, 1]
         context_vector    = torch.sum(attention_weights * features, dim=0) # [hidden]
         action_logits     = self.policy_head(context_vector)               # [hidden]
-        return action_logits, attention_weights
+        return action_logits, attention_weights.squeeze(-1)                 # [hidden], [N]
 
 
 class PPOTrainer:
@@ -40,6 +58,9 @@ class PPOTrainer:
     train_batch()  -- True PPO2 with clipped surrogate objective:
                         L = min(r*adv, clip(r, 1-eps, 1+eps)*adv)
                       Runs PPO_EPOCHS epochs over the mini-batch.
+
+    sample_action()        -- stochastic sampling of a full join-order permutation
+    sequence_log_prob()    -- log π(permutation | state) used for PPO ratio
 
     Persistence (Part 4):
       save_checkpoint() / load_checkpoint()
@@ -58,48 +79,90 @@ class PPOTrainer:
         self.total_loss  = 0.0
 
     # ------------------------------------------------------------------
-    def _first_table_idx(self, tables, chosen_order) -> int:
-        table_to_idx = {t: i for i, t in enumerate(tables)}
-        return table_to_idx.get(chosen_order[0], 0)
-
-    def _compute_log_prob(self, state_tensor, first_idx: int) -> torch.Tensor:
-        _, attention_weights = self.model(state_tensor)
-        probs = attention_weights.squeeze(-1)
-        return torch.log(probs[first_idx] + 1e-8)
-
+    # Stochastic action: sample a full permutation, return its log-prob
     # ------------------------------------------------------------------
-    def compute_action_log_prob(self, state_tensor, tables, chosen_order):
+
+    def sample_action(self, state_tensor: torch.Tensor, aliases: list) -> tuple[list, float]:
         """
-        Called from /optimize to get log_prob_old BEFORE training.
-        Returns (log_prob_value: float, first_table_idx: int).
-        No gradient tracking needed here.
+        Sample a join-order permutation WITHOUT replacement from the attention
+        distribution.  Returns (ordered_aliases, log_prob_of_full_sequence).
+
+        Called at /optimize time; no gradient tracking needed.
         """
         with torch.no_grad():
-            first_idx = self._first_table_idx(tables, chosen_order)
-            log_prob  = self._compute_log_prob(state_tensor, first_idx)
-        return log_prob.item(), first_idx
+            _, probs = self.model(state_tensor)   # [N]
+            probs    = probs.clone()
+
+        n = len(aliases)
+        remaining_indices  = list(range(n))
+        sampled_order      = []
+        log_prob           = 0.0
+
+        for _ in range(n):
+            # Extract probabilities for remaining tables and renormalise
+            sub_probs = torch.stack([probs[i] for i in remaining_indices])
+            sub_probs = sub_probs / sub_probs.sum()          # renormalise
+
+            dist     = Categorical(sub_probs)
+            local_k  = dist.sample()                         # index into sub_probs
+            log_prob += dist.log_prob(local_k).item()
+
+            chosen_global = remaining_indices[local_k.item()]
+            sampled_order.append(aliases[chosen_global])
+            remaining_indices.remove(chosen_global)
+
+        return sampled_order, log_prob
+
+    def sequence_log_prob(self, state_tensor: torch.Tensor,
+                          aliases: list, ordered_aliases: list) -> torch.Tensor:
+        """
+        Compute log π(ordered_aliases | state_tensor) DIFFERENTIABLY.
+
+        Used in train_batch() so gradients flow back through the policy.
+        Mirrors the sampling logic but keeps the computation graph intact.
+        """
+        _, probs = self.model(state_tensor)   # [N] — with gradient
+        probs    = probs.clone()
+
+        alias_to_idx   = {a: i for i, a in enumerate(aliases)}
+        remaining_idx  = list(range(len(aliases)))
+        log_prob       = torch.tensor(0.0)
+
+        for alias in ordered_aliases:
+            global_idx = alias_to_idx[alias]
+            sub_probs  = torch.stack([probs[i] for i in remaining_idx])
+            sub_probs  = sub_probs / sub_probs.sum()   # renormalise (differentiable)
+
+            local_k = remaining_idx.index(global_idx)
+            log_prob = log_prob + torch.log(sub_probs[local_k] + 1e-8)
+            remaining_idx.remove(global_idx)
+
+        return log_prob
 
     # ------------------------------------------------------------------
+    # REINFORCE fallback (no log_prob_old available)
+    # ------------------------------------------------------------------
+
     def train_step(self, experience: dict) -> dict:
         """
-        REINFORCE fallback — used when log_prob_old is not available
-        (e.g. anomaly-detected queries that were not PPO-optimized).
+        REINFORCE fallback — used when log_prob_old is not available.
+        Trains on the full sequence log-prob so gradient signal is meaningful.
         """
         from vectorizer.schema_vectorizer import build_state_tensor
 
-        tables       = experience["tables"]
+        aliases      = experience["tables"]
         chosen_order = experience["chosen_order"]
         reward       = experience["reward"]
 
-        state_tensor = build_state_tensor(tables)
+        stat_names   = experience.get("stat_names", aliases)
+        state_tensor = build_state_tensor(stat_names)
 
         self.baseline = ((1.0 - self.BASELINE_ALPHA) * self.baseline
                          + self.BASELINE_ALPHA * reward)
         advantage = reward - self.baseline
 
-        first_idx = self._first_table_idx(tables, chosen_order)
-        log_prob  = self._compute_log_prob(state_tensor, first_idx)
-        loss      = -log_prob * advantage
+        log_prob = self.sequence_log_prob(state_tensor, aliases, chosen_order)
+        loss     = -log_prob * advantage
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -125,14 +188,18 @@ class PPOTrainer:
         return metrics
 
     # ------------------------------------------------------------------
+    # True PPO2 batch update
+    # ------------------------------------------------------------------
+
     def train_batch(self, experiences: list) -> dict:
         """
         True PPO2 update with clipped surrogate objective.
 
         Each experience dict must contain:
-          state_tensor  : torch.Tensor [N, 10]
-          first_idx     : int          index of the first table in chosen_order
-          log_prob_old  : float        log π_old(a|s) recorded at optimize time
+          state_tensor  : torch.Tensor [N, input_dim]
+          aliases       : list[str]  — pg_hint_plan identifiers (in state order)
+          chosen_order  : list[str]  — sampled permutation recorded at optimize time
+          log_prob_old  : float      — log π_old(full sequence | s), from pending store
           reward        : float
 
         Runs PPO_EPOCHS epochs over the batch.
@@ -142,13 +209,14 @@ class PPOTrainer:
 
         total_loss   = 0.0
         total_steps  = 0
-        total_clip   = 0     # how many times the ratio was clipped
+        total_clip   = 0
 
         for epoch in range(self.PPO_EPOCHS):
             epoch_loss = 0.0
             for exp in experiences:
                 state_tensor  = exp["state_tensor"]
-                first_idx     = exp["first_idx"]
+                aliases       = exp["aliases"]
+                chosen_order  = exp["chosen_order"]
                 log_prob_old  = exp["log_prob_old"]
                 reward        = exp["reward"]
 
@@ -157,8 +225,8 @@ class PPOTrainer:
                                  + self.BASELINE_ALPHA * reward)
                 advantage = reward - self.baseline
 
-                # New log-prob under current policy
-                log_prob_new = self._compute_log_prob(state_tensor, first_idx)
+                # New log-prob of the same FULL SEQUENCE under current policy
+                log_prob_new = self.sequence_log_prob(state_tensor, aliases, chosen_order)
 
                 # PPO probability ratio
                 ratio = torch.exp(log_prob_new - torch.tensor(log_prob_old, dtype=torch.float32))
@@ -197,15 +265,15 @@ class PPOTrainer:
         clip_rate  = round(total_clip / max(total_steps, 1) * 100, 1)
 
         metrics = {
-            "mode":        "ppo_clip",
-            "train_step":  self.train_count,
-            "batch_size":  len(experiences),
-            "ppo_epochs":  self.PPO_EPOCHS,
-            "clip_eps":    self.CLIP_EPS,
-            "avg_loss":    round(avg_loss, 6),
+            "mode":          "ppo_clip",
+            "train_step":    self.train_count,
+            "batch_size":    len(experiences),
+            "ppo_epochs":    self.PPO_EPOCHS,
+            "clip_eps":      self.CLIP_EPS,
+            "avg_loss":      round(avg_loss, 6),
             "clip_rate_pct": clip_rate,
-            "avg_reward":  round(avg_reward, 4),
-            "baseline":    round(self.baseline, 4),
+            "avg_reward":    round(avg_reward, 4),
+            "baseline":      round(self.baseline, 4),
         }
         print(
             f"[PPO/Clip] BATCH DONE  batch={len(experiences)}  "
