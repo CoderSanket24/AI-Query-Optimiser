@@ -150,6 +150,7 @@ async def receive_feedback(payload: FeedbackPayload):
     experience = {
         "tables":             payload.tables,
         "stat_names":         payload.real_names if payload.real_names else payload.tables,
+        "join_conditions":    getattr(payload, "join_conditions", []) or [],
         "chosen_order":       payload.chosen_order,
         "latency_ms":         payload.latency_ms,
         "exec_time_ms":       exec_ms,
@@ -188,11 +189,12 @@ async def receive_feedback(payload: FeedbackPayload):
         pending = pop_pending(payload.query_id)
         if pending is not None:
             ppo_exp = {
-                "state_tensor": pending["state_tensor"],
-                "aliases":      pending["aliases"],
-                "chosen_order": payload.chosen_order,
-                "log_prob_old": pending["log_prob_old"],   # ← from server store
-                "reward":       round(reward, 4),
+                "state_tensor":    pending["state_tensor"],
+                "aliases":         pending["aliases"],
+                "chosen_order":    payload.chosen_order,
+                "join_conditions": pending.get("join_conditions", []),  # graph edges
+                "log_prob_old":    pending["log_prob_old"],   # ← from server store
+                "reward":          round(reward, 4),
             }
             with _ppo_batch_lock:
                 _ppo_batch.append(ppo_exp)

@@ -4,17 +4,15 @@ experience_buffer.py
 Bridges the optimize → feedback gap for true PPO.
 
 At /optimize time:
-  store_pending(query_id, state_tensor, log_prob_old, aliases, stat_names)
+  store_pending(query_id, state_tensor, log_prob_old, aliases,
+                stat_names, join_conditions)
 
 At /feedback time:
-  pop_pending(query_id) → dict with state_tensor + log_prob_old
+  pop_pending(query_id) → dict with state_tensor, log_prob_old, aliases,
+                           stat_names, join_conditions
 
 Entries expire after MAX_PENDING_AGE_SEC to prevent memory leaks
 from queries whose feedback never arrives.
-
-Note: log_prob_old is the log-probability of the FULL sampled permutation
-(not just the first table) and is stored server-side so the client cannot
-tamper with it.
 """
 
 import time
@@ -22,19 +20,21 @@ import threading
 
 MAX_PENDING_AGE_SEC = 300   # discard pending entries older than 5 minutes
 
-_pending: dict = {}          # query_id -> {state_tensor, log_prob_old, aliases, stat_names, ts}
+_pending: dict = {}
 _lock = threading.Lock()
 
 
 def store_pending(query_id: int, state_tensor, log_prob_old: float,
-                  aliases: list, stat_names: list) -> None:
+                  aliases: list, stat_names: list,
+                  join_conditions: list | None = None) -> None:
     with _lock:
         _pending[query_id] = {
-            "state_tensor": state_tensor,
-            "log_prob_old": log_prob_old,   # log π_old(full sequence | s), tamper-proof
-            "aliases":      aliases,         # pg_hint_plan identifiers
-            "stat_names":   stat_names,      # physical names for schema stats
-            "ts":           time.time(),
+            "state_tensor":    state_tensor,
+            "log_prob_old":    log_prob_old,     # log π_old(full sequence | s)
+            "aliases":         aliases,           # pg_hint_plan identifiers
+            "stat_names":      stat_names,        # physical names for schema stats
+            "join_conditions": join_conditions or [],  # edge list for graph-aware PPO
+            "ts":              time.time(),
         }
         _evict_old()
 

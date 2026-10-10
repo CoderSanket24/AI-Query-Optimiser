@@ -5,6 +5,10 @@ import time
 URL     = "http://localhost:8080/api/query/execute"
 HEADERS = {"Content-Type": "application/json"}
 
+# Must be comfortably above QueryTelemetryService.STATEMENT_TIMEOUT_MS (10 s)
+# plus Spring/network round-trip overhead.
+HTTP_TIMEOUT_SEC = 30
+
 QUERIES = [
     "SELECT t.title FROM title t JOIN cast_info ci ON t.id=ci.movie_id WHERE t.production_year=1980 LIMIT 10",
     "SELECT t.title FROM title t JOIN cast_info ci ON t.id=ci.movie_id WHERE t.production_year=1985 LIMIT 10",
@@ -78,15 +82,18 @@ def run():
 
         print(f"[{i:02d}/{total}] Running...")
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
                 res       = json.loads(resp.read())
-                exec_time = res.get("exec_time_ms", 0)
+                exec_time = res.get("exec_time_ms", -1)
                 order     = " -> ".join(res.get("choosen_order", []))
-                print(f"         Order : {order}")
-                print(f"         Exec  : {exec_time} ms\n")
+                hinted    = res.get("hint_applied", "?")
+                safe      = res.get("aliases_safe", "?")
+                print(f"         Order  : {order}")
+                print(f"         Exec   : {exec_time} ms  (hint={'yes' if hinted else 'no'}, safe={safe})\n")
                 success += 1
         except Exception as e:
-            print(f"         ERROR : {e}\n")
+            print(f"         ERROR  : {e}  "
+                  f"(if timeout, query was cancelled by statement_timeout)\n")
             failed += 1
 
         time.sleep(0.5)

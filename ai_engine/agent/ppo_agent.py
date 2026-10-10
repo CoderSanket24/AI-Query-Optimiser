@@ -15,24 +15,24 @@ class ExplainableJoinOptimizer(nn.Module):
 
       feature_layer   Linear(input_dim -> hidden_dim)  feature extraction
       attention_layer Linear(hidden_dim -> 1) + softmax  XAI weights per table
-      policy_head     Linear(hidden_dim -> hidden_dim)  unused in action selection
-                      (kept for architecture compatibility; future: value head)
+      policy_head     Linear(hidden_dim -> hidden_dim)  (kept; future value head)
 
     Action space
     ------------
-    A join order is a permutation of the N table aliases.  We model this as
-    sampling WITHOUT replacement from a Categorical distribution:
+    A join order is a permutation of the N table aliases sampled WITHOUT
+    replacement from a Categorical distribution:
 
-      1. Run forward pass → attention_weights [N]  (probabilities over tables)
-      2. Sample table i₁ ~ Categorical(attention_weights)
-      3. Zero out i₁, renormalise → sample i₂, repeat.
+      1. Run forward pass → attention_weights [N]
+      2. Among CONNECTED candidates, sample table i₁ ~ Categorical(sub_probs)
+      3. Zero out i₁, renormalise remaining → repeat until all placed.
 
-    The log-probability of the full permutation is the sum of the per-step
-    log-probs — analogous to pointer-network action log-probs used in
-    neural combinatorial optimisation.
+    "Connected" means: the candidate has at least one join edge to a table
+    already in the prefix — so we never produce a cross-product prefix.
+    When no candidate is connected (isolated node or first step), we fall
+    back to a weighted draw among all remaining tables.
 
-    This makes PPO's probability ratio r = π_new(a|s) / π_old(a|s) meaningful:
-    both π_old and π_new are computed over the same full sequence.
+    The log-probability of the full permutation is the sum of per-step
+    log-probs, analogous to pointer-network action log-probs.
     """
 
     def __init__(self, input_dim: int, hidden_dim: int):
@@ -50,26 +50,68 @@ class ExplainableJoinOptimizer(nn.Module):
         return action_logits, attention_weights.squeeze(-1)                 # [hidden], [N]
 
 
+# ── Join-graph helpers ─────────────────────────────────────────────────────────
+
+def _parse_join_graph(aliases: list[str], join_conditions: list[str]) -> dict[str, set[str]]:
+    """
+    Build an adjacency set from join_conditions.
+
+    join_conditions: list of "leftAlias,rightAlias" strings produced by the
+    Java AST walker.  An empty list means no explicit join edges were found
+    (single-table query or subquery-only joins); the graph will be fully
+    connected so the sampler degrades to unconstrained sampling.
+
+    Returns: { alias -> {neighbour_alias, ...} }
+    """
+    adj: dict[str, set[str]] = {a: set() for a in aliases}
+    for cond in join_conditions:
+        parts = cond.split(",", 1)
+        if len(parts) == 2:
+            left, right = parts[0].strip(), parts[1].strip()
+            if left in adj and right in adj:
+                adj[left].add(right)
+                adj[right].add(left)
+    return adj
+
+
+def _connected_candidates(remaining: list[str],
+                           placed_set: set[str],
+                           adj: dict[str, set[str]]) -> list[str]:
+    """
+    Return the subset of `remaining` that has at least one join-edge to a
+    table already placed.  Falls back to all of `remaining` when:
+      • placed_set is empty (first table — any start is fine), or
+      • no remaining table is connected (e.g. genuinely disconnected query
+        fragment, or no edges were parsed).
+    """
+    if not placed_set:
+        return remaining          # first position: any table may start
+
+    connected = [t for t in remaining if adj.get(t, set()) & placed_set]
+    return connected if connected else remaining   # fallback: no isolation info
+
+
 class PPOTrainer:
     """
-    Part 3+7: PPO Trainer with both single-step and true clipped-PPO batch update.
+    Part 3+7: PPO Trainer with single-step REINFORCE and true clipped-PPO batch.
 
-    train_step()   -- REINFORCE fallback (used when no log_prob_old available)
-    train_batch()  -- True PPO2 with clipped surrogate objective:
-                        L = min(r*adv, clip(r, 1-eps, 1+eps)*adv)
-                      Runs PPO_EPOCHS epochs over the mini-batch.
+    sample_action(state_tensor, aliases, join_conditions)
+      → (ordered_aliases, log_prob)
+      Stochastic, graph-aware: never places a table disconnected from the
+      current prefix (avoids cross-product orders).
 
-    sample_action()        -- stochastic sampling of a full join-order permutation
-    sequence_log_prob()    -- log π(permutation | state) used for PPO ratio
+    sequence_log_prob(state_tensor, aliases, ordered_aliases)
+      → torch.Tensor (scalar, differentiable)
+      Used in train_batch() so gradients flow through the full sequence.
 
-    Persistence (Part 4):
-      save_checkpoint() / load_checkpoint()
+    train_step()    REINFORCE fallback
+    train_batch()   True PPO2 clipped surrogate
     """
 
     GRAD_CLIP      = 0.5
     BASELINE_ALPHA = 0.05
-    CLIP_EPS       = 0.2    # PPO clip epsilon (standard value)
-    PPO_EPOCHS     = 3      # epochs per batch update
+    CLIP_EPS       = 0.2
+    PPO_EPOCHS     = 3
 
     def __init__(self, model: ExplainableJoinOptimizer, lr: float = 1e-3):
         self.model       = model
@@ -78,91 +120,109 @@ class PPOTrainer:
         self.train_count = 0
         self.total_loss  = 0.0
 
-    # ------------------------------------------------------------------
-    # Stochastic action: sample a full permutation, return its log-prob
-    # ------------------------------------------------------------------
+    # ── Stochastic graph-aware sampling ────────────────────────────────────────
 
-    def sample_action(self, state_tensor: torch.Tensor, aliases: list) -> tuple[list, float]:
+    def sample_action(self, state_tensor: torch.Tensor,
+                      aliases: list[str],
+                      join_conditions: list[str] | None = None) -> tuple[list[str], float]:
         """
-        Sample a join-order permutation WITHOUT replacement from the attention
-        distribution.  Returns (ordered_aliases, log_prob_of_full_sequence).
+        Sample a join-order permutation WITHOUT replacement, respecting the
+        join graph so every step extends a connected prefix.
 
-        Called at /optimize time; no gradient tracking needed.
+        join_conditions: list of "leftAlias,rightAlias" edge strings from Java.
+          None / [] → unconstrained sampling (degrades gracefully).
+
+        Returns (ordered_aliases, log_prob_of_full_sequence).
         """
+        adj = _parse_join_graph(aliases, join_conditions or [])
+
         with torch.no_grad():
             _, probs = self.model(state_tensor)   # [N]
             probs    = probs.clone()
 
-        n = len(aliases)
-        remaining_indices  = list(range(n))
-        sampled_order      = []
-        log_prob           = 0.0
+        alias_to_global = {a: i for i, a in enumerate(aliases)}
+        remaining       = list(aliases)
+        placed_set: set[str] = set()
+        sampled_order: list[str] = []
+        log_prob = 0.0
 
-        for _ in range(n):
-            # Extract probabilities for remaining tables and renormalise
-            sub_probs = torch.stack([probs[i] for i in remaining_indices])
-            sub_probs = sub_probs / sub_probs.sum()          # renormalise
+        for _ in range(len(aliases)):
+            # Restrict candidates to join-graph-connected tables
+            candidates = _connected_candidates(remaining, placed_set, adj)
 
-            dist     = Categorical(sub_probs)
-            local_k  = dist.sample()                         # index into sub_probs
+            # Build sub-distribution over candidates
+            cand_indices = [alias_to_global[a] for a in candidates]
+            sub_probs    = torch.stack([probs[i] for i in cand_indices])
+            sub_probs    = sub_probs / sub_probs.sum()   # renormalise
+
+            dist    = Categorical(sub_probs)
+            local_k = dist.sample()
             log_prob += dist.log_prob(local_k).item()
 
-            chosen_global = remaining_indices[local_k.item()]
-            sampled_order.append(aliases[chosen_global])
-            remaining_indices.remove(chosen_global)
+            chosen = candidates[local_k.item()]
+            sampled_order.append(chosen)
+            placed_set.add(chosen)
+            remaining.remove(chosen)
 
         return sampled_order, log_prob
 
     def sequence_log_prob(self, state_tensor: torch.Tensor,
-                          aliases: list, ordered_aliases: list) -> torch.Tensor:
+                          aliases: list[str],
+                          ordered_aliases: list[str],
+                          join_conditions: list[str] | None = None) -> torch.Tensor:
         """
         Compute log π(ordered_aliases | state_tensor) DIFFERENTIABLY.
-
-        Used in train_batch() so gradients flow back through the policy.
-        Mirrors the sampling logic but keeps the computation graph intact.
+        Mirrors sample_action() but keeps the computation graph intact
+        so gradients flow back through the policy.
         """
-        _, probs = self.model(state_tensor)   # [N] — with gradient
+        adj = _parse_join_graph(aliases, join_conditions or [])
+
+        _, probs = self.model(state_tensor)   # [N] with gradient
         probs    = probs.clone()
 
-        alias_to_idx   = {a: i for i, a in enumerate(aliases)}
-        remaining_idx  = list(range(len(aliases)))
-        log_prob       = torch.tensor(0.0)
+        alias_to_global = {a: i for i, a in enumerate(aliases)}
+        remaining       = list(aliases)
+        placed_set: set[str] = set()
+        log_prob = torch.tensor(0.0)
 
         for alias in ordered_aliases:
-            global_idx = alias_to_idx[alias]
-            sub_probs  = torch.stack([probs[i] for i in remaining_idx])
-            sub_probs  = sub_probs / sub_probs.sum()   # renormalise (differentiable)
+            candidates   = _connected_candidates(remaining, placed_set, adj)
+            cand_indices = [alias_to_global[a] for a in candidates]
+            sub_probs    = torch.stack([probs[i] for i in cand_indices])
+            sub_probs    = sub_probs / sub_probs.sum()
 
-            local_k = remaining_idx.index(global_idx)
+            local_k  = candidates.index(alias)
             log_prob = log_prob + torch.log(sub_probs[local_k] + 1e-8)
-            remaining_idx.remove(global_idx)
+
+            placed_set.add(alias)
+            remaining.remove(alias)
 
         return log_prob
 
-    # ------------------------------------------------------------------
-    # REINFORCE fallback (no log_prob_old available)
-    # ------------------------------------------------------------------
+    # ── REINFORCE fallback ─────────────────────────────────────────────────────
 
     def train_step(self, experience: dict) -> dict:
         """
-        REINFORCE fallback — used when log_prob_old is not available.
-        Trains on the full sequence log-prob so gradient signal is meaningful.
+        REINFORCE — used when log_prob_old is not available.
+        Trains on the full sequence log-prob so gradient covers all join steps.
         """
         from vectorizer.schema_vectorizer import build_state_tensor
 
-        aliases      = experience["tables"]
-        chosen_order = experience["chosen_order"]
-        reward       = experience["reward"]
+        aliases         = experience["tables"]
+        chosen_order    = experience["chosen_order"]
+        reward          = experience["reward"]
+        stat_names      = experience.get("stat_names", aliases)
+        join_conditions = experience.get("join_conditions", [])
 
-        stat_names   = experience.get("stat_names", aliases)
         state_tensor = build_state_tensor(stat_names)
 
         self.baseline = ((1.0 - self.BASELINE_ALPHA) * self.baseline
                          + self.BASELINE_ALPHA * reward)
         advantage = reward - self.baseline
 
-        log_prob = self.sequence_log_prob(state_tensor, aliases, chosen_order)
-        loss     = -log_prob * advantage
+        log_prob = self.sequence_log_prob(state_tensor, aliases, chosen_order,
+                                          join_conditions)
+        loss = -log_prob * advantage
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -187,58 +247,55 @@ class PPOTrainer:
         )
         return metrics
 
-    # ------------------------------------------------------------------
-    # True PPO2 batch update
-    # ------------------------------------------------------------------
+    # ── True PPO2 batch update ─────────────────────────────────────────────────
 
     def train_batch(self, experiences: list) -> dict:
         """
         True PPO2 update with clipped surrogate objective.
 
         Each experience dict must contain:
-          state_tensor  : torch.Tensor [N, input_dim]
-          aliases       : list[str]  — pg_hint_plan identifiers (in state order)
-          chosen_order  : list[str]  — sampled permutation recorded at optimize time
-          log_prob_old  : float      — log π_old(full sequence | s), from pending store
-          reward        : float
-
-        Runs PPO_EPOCHS epochs over the batch.
+          state_tensor    : torch.Tensor [N, input_dim]
+          aliases         : list[str]  — pg_hint_plan identifiers
+          chosen_order    : list[str]  — sampled permutation
+          join_conditions : list[str]  — edge strings (may be [])
+          log_prob_old    : float      — log π_old(full sequence | s), server-side
+          reward          : float
         """
         if not experiences:
             return {}
 
-        total_loss   = 0.0
-        total_steps  = 0
-        total_clip   = 0
+        total_loss  = 0.0
+        total_steps = 0
+        total_clip  = 0
 
         for epoch in range(self.PPO_EPOCHS):
             epoch_loss = 0.0
             for exp in experiences:
-                state_tensor  = exp["state_tensor"]
-                aliases       = exp["aliases"]
-                chosen_order  = exp["chosen_order"]
-                log_prob_old  = exp["log_prob_old"]
-                reward        = exp["reward"]
+                state_tensor    = exp["state_tensor"]
+                aliases         = exp["aliases"]
+                chosen_order    = exp["chosen_order"]
+                join_conditions = exp.get("join_conditions", [])
+                log_prob_old    = exp["log_prob_old"]
+                reward          = exp["reward"]
 
-                # Update EMA baseline
                 self.baseline = ((1.0 - self.BASELINE_ALPHA) * self.baseline
                                  + self.BASELINE_ALPHA * reward)
                 advantage = reward - self.baseline
 
-                # New log-prob of the same FULL SEQUENCE under current policy
-                log_prob_new = self.sequence_log_prob(state_tensor, aliases, chosen_order)
+                log_prob_new = self.sequence_log_prob(
+                    state_tensor, aliases, chosen_order, join_conditions)
 
-                # PPO probability ratio
-                ratio = torch.exp(log_prob_new - torch.tensor(log_prob_old, dtype=torch.float32))
+                ratio = torch.exp(
+                    log_prob_new - torch.tensor(log_prob_old, dtype=torch.float32))
 
-                # Clipped surrogate
                 surr1 = ratio * advantage
-                surr2 = torch.clamp(ratio, 1.0 - self.CLIP_EPS, 1.0 + self.CLIP_EPS) * advantage
+                surr2 = torch.clamp(ratio,
+                                    1.0 - self.CLIP_EPS,
+                                    1.0 + self.CLIP_EPS) * advantage
                 loss  = -torch.min(surr1, surr2)
 
-                was_clipped = (ratio.item() < 1.0 - self.CLIP_EPS or
-                               ratio.item() > 1.0 + self.CLIP_EPS)
-                if was_clipped:
+                if (ratio.item() < 1.0 - self.CLIP_EPS or
+                        ratio.item() > 1.0 + self.CLIP_EPS):
                     total_clip += 1
 
                 self.optimizer.zero_grad()
@@ -282,7 +339,8 @@ class PPOTrainer:
         )
         return metrics
 
-    # ------------------------------------------------------------------
+    # ── Persistence ────────────────────────────────────────────────────────────
+
     def save_checkpoint(self):
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
         torch.save({
