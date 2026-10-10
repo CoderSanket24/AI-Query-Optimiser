@@ -16,24 +16,38 @@ import java.sql.Statement;
  *   wait_time_ms  -- time to acquire a JDBC connection from HikariCP pool.
  *                    High wait + low connections = DB under DoS stress.
  *
- *   exec_time_ms  -- time PostgreSQL spends actually running the query
- *                    (total_wall_time - wait_time).
- *                    This is what the PPO join order affects.
+ *   exec_time_ms  -- time PostgreSQL spends actually running the query.
  *                    Uses System.nanoTime() so fast queries do NOT round to 0.
+ *                    -1 = EXEC_TIME_MISSING sentinel.
  *
  *   latency_ms    -- total wall-clock time (wait + exec), kept for compatibility.
  *
- * active_connections -- current number of active sessions in pg_stat_activity.
+ * active_connections -- current active sessions in pg_stat_activity.
  *
- * IMPORTANT: exec_time_ms is -1 when timing is genuinely unavailable (should
- * never happen in practice). feedback.py treats -1 as "missing" and falls back
- * to REINFORCE rather than silently leaking wait_time into the reward.
+ * Statement timeout (Bug fix: disconnected-graph hang):
+ *   Before running EXPLAIN ANALYZE, we set statement_timeout on the session.
+ *   If a bad PPO-sampled join order forces a cross-product that would run for
+ *   hours (e.g. Leading(((ci mk) t)) with cast_info at 36M rows), PostgreSQL
+ *   will cancel it after STATEMENT_TIMEOUT_MS milliseconds and throw an
+ *   exception.  The exception is caught, EXEC_TIME_MISSING is reported, and
+ *   feedback.py skips reward computation — so PPO learns nothing from the
+ *   timed-out query rather than hanging indefinitely.
+ *
+ *   The timeout is reset to 0 (unlimited) after execution so it does not
+ *   affect subsequent unrelated sessions sharing the pool.
  */
 @Service
 public class QueryTelemetryService {
 
     /** Sentinel: exec time could not be measured (not zero, which is valid). */
     public static final long EXEC_TIME_MISSING = -1L;
+
+    /**
+     * Maximum wall-clock time allowed for a single query.
+     * 10 seconds is generous for the IMDB benchmark queries; reduce for stricter
+     * enforcement.  Set to 0 to disable (not recommended with stochastic hints).
+     */
+    private static final int STATEMENT_TIMEOUT_MS = 10_000;
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
@@ -50,27 +64,42 @@ public class QueryTelemetryService {
             jdbcTemplate.queryForObject(contentionQuery, Integer.class);
 
         // 2. Measure wait_time: time to acquire connection from HikariCP pool.
-        //    Use nanoTime for sub-millisecond precision — fast pools return in
-        //    microseconds and currentTimeMillis rounds to 0.
+        //    nanoTime for sub-millisecond precision.
         long waitStart = System.nanoTime();
         Connection conn = dataSource.getConnection();
         long waitTimeMs = (System.nanoTime() - waitStart) / 1_000_000L;
 
-        // 3. Measure exec_time: time PostgreSQL spends running the query.
-        //    Also uses nanoTime so short analytical queries are not reported as 0.
-        long execStart = System.nanoTime();
-        long execTimeMs;
+        // 3. Measure exec_time under a statement_timeout guard.
+        //    The timeout is set on the session before running the query and
+        //    reset to 0 (unlimited) afterward so it does not bleed into other
+        //    pool sessions.
+        long execStart  = System.nanoTime();
+        long execTimeMs = EXEC_TIME_MISSING;
+
         try (Statement stmt = conn.createStatement()) {
+            // Arm the per-session timeout (PostgreSQL will cancel automatically)
+            if (STATEMENT_TIMEOUT_MS > 0) {
+                stmt.execute("SET LOCAL statement_timeout = '" + STATEMENT_TIMEOUT_MS + "ms'");
+            }
+
             stmt.execute("EXPLAIN ANALYZE " + finalSql);
             execTimeMs = (System.nanoTime() - execStart) / 1_000_000L;
+
+        } catch (Exception queryEx) {
+            // statement_timeout cancellation (or any other query error).
+            // execTimeMs stays EXEC_TIME_MISSING; feedback.py will skip reward.
+            System.out.println("[Telemetry] Query cancelled or failed: " + queryEx.getMessage());
         } finally {
-            conn.close();   // return connection to pool
+            // Always release the connection back to the pool.
+            // SET LOCAL is session-scoped and reset automatically on transaction
+            // end, but closing the connection also returns it to a clean state.
+            conn.close();
         }
 
-        long latencyMs = waitTimeMs + execTimeMs;
+        long latencyMs = waitTimeMs + (execTimeMs == EXEC_TIME_MISSING ? 0 : execTimeMs);
 
         System.out.println("[Telemetry] wait=" + waitTimeMs + "ms"
-            + "  exec=" + execTimeMs + "ms"
+            + "  exec=" + (execTimeMs == EXEC_TIME_MISSING ? "TIMEOUT" : execTimeMs + "ms")
             + "  total=" + latencyMs + "ms"
             + "  connections=" + activeConnections);
 
@@ -80,7 +109,7 @@ public class QueryTelemetryService {
     // ── Result holder ──────────────────────────────────────────────────────────
     public static class TelemetryResult {
         public long latencyMs;      // total  = wait + exec
-        public long execTimeMs;     // PPO reward signal  (join order affects this); -1 = missing
+        public long execTimeMs;     // PPO reward signal; EXEC_TIME_MISSING (-1) = timed out
         public long waitTimeMs;     // Isolation Forest signal (DoS detection)
         public int  activeConnections;
 

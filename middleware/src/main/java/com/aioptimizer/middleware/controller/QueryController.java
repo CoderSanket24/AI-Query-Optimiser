@@ -10,17 +10,26 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.client.RestTemplate;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("api/query")
 public class QueryController {
 
+    /**
+     * Safe alias pattern: must start with a letter or underscore, followed by
+     * letters, digits, or underscores only.  Quoted aliases containing */ or ;
+     * could otherwise escape the pg_hint_plan comment and inject SQL.
+     */
+    private static final Pattern SAFE_ALIAS = Pattern.compile("^[A-Za-z_][A-Za-z0-9_]*$");
+
     private QueryTelemetryService queryTelemetryService;
-    private AstFirewall astFirewall;
+    private AstFirewall           astFirewall;
     private QueryFeatureExtractor extractor;
 
     private final RestTemplate restTemplate = new RestTemplate();
@@ -29,8 +38,8 @@ public class QueryController {
                            AstFirewall astFirewall,
                            QueryFeatureExtractor extractor) {
         this.queryTelemetryService = queryTelemetryService;
-        this.astFirewall = astFirewall;
-        this.extractor = extractor;
+        this.astFirewall           = astFirewall;
+        this.extractor             = extractor;
     }
 
     @PostMapping("/execute")
@@ -49,34 +58,57 @@ public class QueryController {
                 return ResponseEntity.badRequest().body("ERROR: SQL query cannot be empty.");
             }
 
-            // Step 3: Firewall check
+            // Step 3: Firewall check on the ORIGINAL SQL
             System.out.println("3. Sending to Firewall...");
             astFirewall.inspectQuery(sql);
 
-            // Step 4: Extract alias→realName pairs from AST.
+            // Step 4: Extract alias→realName pairs AND join edges from AST.
             //   alias    = identifier pg_hint_plan sees in the SQL  (used for hints)
             //   realName = physical table name                       (used for schema stats)
-            System.out.println("4. Firewall passed! Extracting table refs...");
-            List<QueryFeatureExtractor.TableRef> tableRefs = extractor.extractTableRefs(sql);
+            //   edges    = list of "leftAlias,rightAlias" strings   (join graph for Python)
+            System.out.println("4. Firewall passed! Extracting table refs and join edges...");
+            QueryFeatureExtractor.ExtractionResult extraction = extractor.extract(sql);
 
-            List<String> aliases   = tableRefs.stream()
-                                              .map(r -> r.alias)
-                                              .collect(Collectors.toList());
-            List<String> realNames = tableRefs.stream()
-                                              .map(r -> r.realName)
-                                              .collect(Collectors.toList());
+            List<String> aliases   = extraction.tableRefs.stream()
+                                                          .map(r -> r.alias)
+                                                          .collect(Collectors.toList());
+            List<String> realNames = extraction.tableRefs.stream()
+                                                          .map(r -> r.realName)
+                                                          .collect(Collectors.toList());
 
-            System.out.println("Aliases   (for hints) : " + aliases);
-            System.out.println("RealNames (for stats) : " + realNames);
+            // Encode each join edge as "leftAlias,rightAlias" for Python
+            List<String> joinConditions = extraction.joinEdges.stream()
+                                                              .map(e -> e.leftAlias + "," + e.rightAlias)
+                                                              .collect(Collectors.toList());
+
+            System.out.println("Aliases        : " + aliases);
+            System.out.println("RealNames      : " + realNames);
+            System.out.println("Join edges     : " + joinConditions);
+
+            // Step 4b: Alias whitelist — every alias must match ^[A-Za-z_][A-Za-z0-9_]*$.
+            // A quoted alias like `*/ ; DROP TABLE` could escape the pg_hint_plan comment
+            // and inject SQL into the executed string.  Flag unsafe aliases and tell Python
+            // to run the query unhinted.
+            boolean aliasesAreSafe = aliases.stream().allMatch(a -> SAFE_ALIAS.matcher(a).matches());
+            if (!aliasesAreSafe) {
+                List<String> unsafe = aliases.stream()
+                                             .filter(a -> !SAFE_ALIAS.matcher(a).matches())
+                                             .collect(Collectors.toList());
+                System.out.println("[SECURITY] Unsafe aliases detected: " + unsafe
+                    + " — query will run unhinted.");
+            }
 
             // Step 5: Ask AI engine to optimise join order.
-            //   tables     → aliases   (Python builds hint with these identifiers)
-            //   real_names → realNames (Python fetches schema stats with these)
+            //   tables          → aliases  (Python builds hint with these identifiers)
+            //   real_names      → realNames (Python fetches schema stats with these)
+            //   join_conditions → edge list (Python graph-aware sampler)
+            //   aliases_safe    → false means Python must NOT emit a hint
             Map<String, Object> pythonPayload = new HashMap<>();
             pythonPayload.put("tables",          aliases);
             pythonPayload.put("real_names",      realNames);
-            pythonPayload.put("join_conditions", List.of());
+            pythonPayload.put("join_conditions", joinConditions);
             pythonPayload.put("original_sql",    sql);
+            pythonPayload.put("aliases_safe",    aliasesAreSafe);
 
             String pythonAiUrl = "http://localhost:8000/optimize";
             ResponseEntity<Map> aiResponse = restTemplate.postForEntity(pythonAiUrl, pythonPayload, Map.class);
@@ -84,23 +116,20 @@ public class QueryController {
             String       optimizedSql = (String)       aiResponse.getBody().get("optimized_query");
             List<String> chosenOrder  = (List<String>) aiResponse.getBody().get("choosen_order");
 
-            // Extract query_id only.
-            // log_prob_old is NO LONGER round-tripped through Java — /feedback reads
-            // it from the server-side pending store so the client cannot tamper with it.
+            // Extract query_id only — log_prob_old is stored server-side.
             Object  queryIdObj = aiResponse.getBody().get("query_id");
             Integer queryId    = (queryIdObj instanceof Number) ? ((Number) queryIdObj).intValue() : null;
 
-            // Step 6: Execute query — measures wait_time_ms AND exec_time_ms separately
+            // Step 6: Execute query under statement_timeout guard
             QueryTelemetryService.TelemetryResult metrics = queryTelemetryService.executeAndTrack(optimizedSql);
 
             System.out.println("Wait Time:    " + metrics.waitTimeMs  + " ms");
-            System.out.println("Exec Time:    " + metrics.execTimeMs  + " ms");
+            System.out.println("Exec Time:    " + (metrics.execTimeMs == QueryTelemetryService.EXEC_TIME_MISSING
+                                                    ? "TIMEOUT" : metrics.execTimeMs + " ms"));
             System.out.println("Total:        " + metrics.latencyMs   + " ms");
             System.out.println("Connections:  " + metrics.activeConnections);
 
-            // Step 7: Send feedback with full telemetry (Isolation Forest + PPO reward).
-            // log_prob_old is intentionally omitted — feedback.py fetches it from
-            // the pending store that /optimize already populated.
+            // Step 7: Send feedback — log_prob_old NOT forwarded (read from server-side store)
             try {
                 Map<String, Object> feedbackPayload = new HashMap<>();
                 feedbackPayload.put("tables",             aliases);
@@ -134,6 +163,7 @@ public class QueryController {
             finalResponse.put("exec_time_ms",       metrics.execTimeMs);
             finalResponse.put("wait_time_ms",       metrics.waitTimeMs);
             finalResponse.put("active_connections", metrics.activeConnections);
+            finalResponse.put("aliases_safe",       aliasesAreSafe);
 
             return ResponseEntity.ok(finalResponse);
 
