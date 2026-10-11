@@ -24,17 +24,14 @@ import java.sql.Statement;
  *
  * active_connections -- current active sessions in pg_stat_activity.
  *
- * Statement timeout (Bug fix: disconnected-graph hang):
- *   Before running EXPLAIN ANALYZE, we set statement_timeout on the session.
- *   If a bad PPO-sampled join order forces a cross-product that would run for
- *   hours (e.g. Leading(((ci mk) t)) with cast_info at 36M rows), PostgreSQL
- *   will cancel it after STATEMENT_TIMEOUT_MS milliseconds and throw an
- *   exception.  The exception is caught, EXEC_TIME_MISSING is reported, and
- *   feedback.py skips reward computation — so PPO learns nothing from the
- *   timed-out query rather than hanging indefinitely.
- *
- *   The timeout is reset to 0 (unlimited) after execution so it does not
- *   affect subsequent unrelated sessions sharing the pool.
+ * Statement timeout guard:
+ *   SET statement_timeout is issued on the session before every EXPLAIN ANALYZE.
+ *   PostgreSQL §20.1: SET LOCAL outside a transaction block has NO effect and
+ *   emits a warning.  HikariCP uses autocommit (no open transaction), so we use
+ *   plain SET (session-scoped).  An explicit RESET statement_timeout is issued in
+ *   a finally block BEFORE conn.close() so the connection is clean when it returns
+ *   to the pool.  If RESET fails, Connection.abort() is called so HikariCP evicts
+ *   the dirty connection rather than recycling it.
  */
 @Service
 public class QueryTelemetryService {
@@ -64,47 +61,89 @@ public class QueryTelemetryService {
             jdbcTemplate.queryForObject(contentionQuery, Integer.class);
 
         // 2. Measure wait_time: time to acquire connection from HikariCP pool.
-        //    nanoTime for sub-millisecond precision.
         long waitStart = System.nanoTime();
         Connection conn = dataSource.getConnection();
         long waitTimeMs = (System.nanoTime() - waitStart) / 1_000_000L;
 
-        // 3. Measure exec_time under a statement_timeout guard.
-        //    The timeout is set on the session before running the query and
-        //    reset to 0 (unlimited) afterward so it does not bleed into other
-        //    pool sessions.
         long execStart  = System.nanoTime();
         long execTimeMs = EXEC_TIME_MISSING;
 
-        try (Statement stmt = conn.createStatement()) {
-            // Arm the per-session timeout (PostgreSQL will cancel automatically)
-            if (STATEMENT_TIMEOUT_MS > 0) {
-                stmt.execute("SET LOCAL statement_timeout = '" + STATEMENT_TIMEOUT_MS + "ms'");
+        try {
+            // 3. Execute under statement_timeout guard.
+            //    SET (session-scoped) works on autocommit connections.
+            //    SET LOCAL outside a transaction block has no effect (PostgreSQL §20.1).
+            try (Statement stmt = conn.createStatement()) {
+                if (STATEMENT_TIMEOUT_MS > 0) {
+                    stmt.execute("SET statement_timeout = '" + STATEMENT_TIMEOUT_MS + "ms'");
+                }
+                stmt.execute("EXPLAIN ANALYZE " + finalSql);
+                execTimeMs = (System.nanoTime() - execStart) / 1_000_000L;
+
+            } catch (Exception queryEx) {
+                // Timeout (SQLState 57014) or any other query error.
+                // execTimeMs stays EXEC_TIME_MISSING; feedback.py skips reward.
+                System.out.println("[Telemetry] Query failed/cancelled"
+                    + " (SQLState=" + sqlStateOf(queryEx) + "): " + queryEx.getMessage());
+
+            } finally {
+                // Always RESET before returning the connection to the pool —
+                // whether the query succeeded, timed out, or failed for another reason.
+                // A fresh Statement is needed because the prior one was closed by TWR.
+                if (STATEMENT_TIMEOUT_MS > 0) {
+                    resetTimeout(conn);
+                }
             }
-
-            stmt.execute("EXPLAIN ANALYZE " + finalSql);
-            execTimeMs = (System.nanoTime() - execStart) / 1_000_000L;
-
-        } catch (Exception queryEx) {
-            // statement_timeout cancellation (or any other query error).
-            // execTimeMs stays EXEC_TIME_MISSING; feedback.py will skip reward.
-            System.out.println("[Telemetry] Query cancelled or failed: " + queryEx.getMessage());
         } finally {
-            // Always release the connection back to the pool.
-            // SET LOCAL is session-scoped and reset automatically on transaction
-            // end, but closing the connection also returns it to a clean state.
+            // conn.close() always runs.  If resetTimeout() called abort(), HikariCP
+            // detects the dead physical connection here and evicts it instead of
+            // recycling it — no separate eviction call needed.
             conn.close();
         }
 
         long latencyMs = waitTimeMs + (execTimeMs == EXEC_TIME_MISSING ? 0 : execTimeMs);
-
         System.out.println("[Telemetry] wait=" + waitTimeMs + "ms"
-            + "  exec=" + (execTimeMs == EXEC_TIME_MISSING ? "TIMEOUT" : execTimeMs + "ms")
+            + "  exec=" + (execTimeMs == EXEC_TIME_MISSING ? "CANCELLED" : execTimeMs + "ms")
             + "  total=" + latencyMs + "ms"
             + "  connections=" + activeConnections);
-
         return new TelemetryResult(latencyMs, execTimeMs, waitTimeMs, activeConnections);
     }
+
+    /**
+     * Runs RESET statement_timeout on a fresh Statement so the pooled connection
+     * is clean for the next borrower.  If RESET itself fails (network drop, etc.)
+     * the physical connection is aborted; HikariCP will evict it on close().
+     */
+    private void resetTimeout(Connection conn) {
+        try (Statement rst = conn.createStatement()) {
+            rst.execute("RESET statement_timeout");
+        } catch (Exception resetEx) {
+            System.err.println("[Telemetry] RESET statement_timeout failed — "
+                + "aborting connection to prevent dirty pool re-use. Cause: "
+                + resetEx.getMessage());
+            try {
+                // abort() closes the underlying physical connection.
+                // conn.close() in the outer finally then tells HikariCP the
+                // connection is dead, and HikariCP evicts it from the pool.
+                conn.abort(Runnable::run);
+            } catch (Exception abortEx) {
+                // Last-resort: log clearly. The connection will be returned to
+                // the pool with statement_timeout still set; HikariCP's
+                // connection-validation query (isValid / keepalive) may evict it
+                // on the next borrow cycle, but there is no hard guarantee.
+                System.err.println("[Telemetry] abort() also failed — connection "
+                    + "may be returned dirty. Cause: " + abortEx.getMessage());
+            }
+        }
+    }
+
+    /** Extracts the SQLState string from a SQLException, or "n/a" for other exceptions. */
+    private static String sqlStateOf(Exception ex) {
+        if (ex instanceof java.sql.SQLException sqle && sqle.getSQLState() != null) {
+            return sqle.getSQLState();
+        }
+        return "n/a";
+    }
+
 
     // ── Result holder ──────────────────────────────────────────────────────────
     public static class TelemetryResult {
