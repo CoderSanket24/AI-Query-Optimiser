@@ -1,8 +1,10 @@
 package com.aioptimizer.middleware.controller;
 
 import com.aioptimizer.middleware.security.AstFirewall;
+import com.aioptimizer.middleware.service.CarbonEstimator;
 import com.aioptimizer.middleware.service.QueryFeatureExtractor;
 import com.aioptimizer.middleware.service.QueryTelemetryService;
+import com.aioptimizer.middleware.model.CarbonResult;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -23,7 +25,7 @@ public class QueryController {
 
     /**
      * Safe alias pattern: must start with a letter or underscore, followed by
-     * letters, digits, or underscores only.  Quoted aliases containing */ or ;
+     * letters, digits, or underscores only.  Quoted aliases containing *&#47; or ;
      * could otherwise escape the pg_hint_plan comment and inject SQL.
      */
     private static final Pattern SAFE_ALIAS = Pattern.compile("^[A-Za-z_][A-Za-z0-9_]*$");
@@ -31,15 +33,18 @@ public class QueryController {
     private QueryTelemetryService queryTelemetryService;
     private AstFirewall           astFirewall;
     private QueryFeatureExtractor extractor;
+    private CarbonEstimator       carbonEstimator;
 
     private final RestTemplate restTemplate = new RestTemplate();
 
     public QueryController(QueryTelemetryService queryTelemetryService,
                            AstFirewall astFirewall,
-                           QueryFeatureExtractor extractor) {
+                           QueryFeatureExtractor extractor,
+                           CarbonEstimator carbonEstimator) {
         this.queryTelemetryService = queryTelemetryService;
         this.astFirewall           = astFirewall;
         this.extractor             = extractor;
+        this.carbonEstimator       = carbonEstimator;
     }
 
     @PostMapping("/execute")
@@ -129,6 +134,12 @@ public class QueryController {
             System.out.println("Total:        " + metrics.latencyMs   + " ms");
             System.out.println("Connections:  " + metrics.activeConnections);
 
+            // Step 6b: Carbon emission estimate (third pillar).
+            // Returns CarbonResult.unavailable() when the query was cancelled.
+            CarbonResult carbon = carbonEstimator.estimate(metrics);
+            System.out.printf("CO₂:          %.4f g  (energy: %.6f kWh)%n",
+                              carbon.co2Grams, carbon.energyKwh);
+
             // Step 7: Send feedback — log_prob_old NOT forwarded (read from server-side store)
             try {
                 Map<String, Object> feedbackPayload = new HashMap<>();
@@ -157,13 +168,18 @@ public class QueryController {
                 System.out.println("Warning: Feedback failed: " + feedbackEx.getMessage());
             }
 
-            // Step 8: Return enriched response
+            // Step 8: Return enriched response (latency + carbon fields)
             Map<String, Object> finalResponse = new HashMap<>(aiResponse.getBody());
             finalResponse.put("latency_ms",        metrics.latencyMs);
             finalResponse.put("exec_time_ms",       metrics.execTimeMs);
             finalResponse.put("wait_time_ms",       metrics.waitTimeMs);
             finalResponse.put("active_connections", metrics.activeConnections);
             finalResponse.put("aliases_safe",       aliasesAreSafe);
+            // Carbon pillar fields
+            finalResponse.put("co2_grams",          carbon.co2Grams);
+            finalResponse.put("energy_kwh",         carbon.energyKwh);
+            finalResponse.put("cpu_energy_kwh",     carbon.cpuEnergyKwh);
+            finalResponse.put("io_energy_kwh",      carbon.ioEnergyKwh);
 
             return ResponseEntity.ok(finalResponse);
 

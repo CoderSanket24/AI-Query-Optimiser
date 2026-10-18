@@ -9,6 +9,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.TimeZone;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -49,6 +50,11 @@ class QueryTelemetryServiceIntegrationTest {
             System.getenv("JOINSENSE_TEST_DB_URL") != null,
             "JOINSENSE_TEST_DB_URL not set — skipping integration tests"
         );
+
+        // PostgreSQL 18 rejects "Asia/Calcutta" (deprecated alias used by the Windows JVM).
+        // Set the JVM timezone to UTC before the pool opens so the driver sends a valid name.
+        // This affects only this test JVM, not statement_timeout behaviour.
+        TimeZone.setDefault(TimeZone.getTimeZone("UTC"));
 
         HikariConfig cfg = new HikariConfig();
         cfg.setJdbcUrl(System.getenv("JOINSENSE_TEST_DB_URL"));

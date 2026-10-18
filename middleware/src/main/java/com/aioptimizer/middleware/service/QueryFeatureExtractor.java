@@ -166,9 +166,11 @@ public class QueryFeatureExtractor {
                 refs.addAll(subRefs);
             }
 
-        } else if (item instanceof ParenthesedFromItem) {
-            collectFromItem(((ParenthesedFromItem) item).getFromItem(), refs, aliasMap);
         }
+        // Note: parenthesised FROM items (e.g. "(t1 JOIN t2) AS sub") are not
+        // representable in JSQLParser 4.6 (ParenthesedFromItem was added in 4.7).
+        // If the parser produces an unknown FromItem subtype we simply ignore it;
+        // the join graph will be incomplete and item 1.3 will suppress the hint.
     }
 
     /**

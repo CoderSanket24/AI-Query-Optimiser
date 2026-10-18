@@ -44,7 +44,7 @@ public class QueryTelemetryService {
      * 10 seconds is generous for the IMDB benchmark queries; reduce for stricter
      * enforcement.  Set to 0 to disable (not recommended with stochastic hints).
      */
-    private static final int STATEMENT_TIMEOUT_MS = 10_000;
+    public static final int STATEMENT_TIMEOUT_MS = 10_000;
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
@@ -65,8 +65,10 @@ public class QueryTelemetryService {
         Connection conn = dataSource.getConnection();
         long waitTimeMs = (System.nanoTime() - waitStart) / 1_000_000L;
 
-        long execStart  = System.nanoTime();
-        long execTimeMs = EXEC_TIME_MISSING;
+        long execStart    = System.nanoTime();
+        long execTimeMs   = EXEC_TIME_MISSING;
+        long blksReadBefore = 0L;
+        long blksReadAfter  = 0L;
 
         try {
             // 3. Execute under statement_timeout guard.
@@ -76,6 +78,9 @@ public class QueryTelemetryService {
                 if (STATEMENT_TIMEOUT_MS > 0) {
                     stmt.execute("SET statement_timeout = '" + STATEMENT_TIMEOUT_MS + "ms'");
                 }
+                // Snapshot I/O counters before the query runs.
+                blksReadBefore = queryBlksRead();
+
                 stmt.execute("EXPLAIN ANALYZE " + finalSql);
                 execTimeMs = (System.nanoTime() - execStart) / 1_000_000L;
 
@@ -86,6 +91,9 @@ public class QueryTelemetryService {
                     + " (SQLState=" + sqlStateOf(queryEx) + "): " + queryEx.getMessage());
 
             } finally {
+                // Snapshot I/O counters after the query finishes (or is cancelled).
+                blksReadAfter = queryBlksRead();
+
                 // Always RESET before returning the connection to the pool —
                 // whether the query succeeded, timed out, or failed for another reason.
                 // A fresh Statement is needed because the prior one was closed by TWR.
@@ -104,8 +112,25 @@ public class QueryTelemetryService {
         System.out.println("[Telemetry] wait=" + waitTimeMs + "ms"
             + "  exec=" + (execTimeMs == EXEC_TIME_MISSING ? "CANCELLED" : execTimeMs + "ms")
             + "  total=" + latencyMs + "ms"
-            + "  connections=" + activeConnections);
-        return new TelemetryResult(latencyMs, execTimeMs, waitTimeMs, activeConnections);
+            + "  connections=" + activeConnections
+            + "  blks_read_delta=" + (blksReadAfter - blksReadBefore));
+        return new TelemetryResult(latencyMs, execTimeMs, waitTimeMs, activeConnections,
+                                   blksReadBefore, blksReadAfter);
+    }
+
+    /**
+     * Reads the cumulative blks_read counter for this database from pg_stat_database.
+     * Returns 0 on any error so a stat failure never interrupts query execution.
+     */
+    private long queryBlksRead() {
+        try {
+            String statSql =
+                "SELECT blks_read FROM pg_stat_database WHERE datname = current_database()";
+            Long val = jdbcTemplate.queryForObject(statSql, Long.class);
+            return (val != null) ? val : 0L;
+        } catch (Exception e) {
+            return 0L;
+        }
     }
 
     /**
@@ -151,13 +176,20 @@ public class QueryTelemetryService {
         public long execTimeMs;     // PPO reward signal; EXEC_TIME_MISSING (-1) = timed out
         public long waitTimeMs;     // Isolation Forest signal (DoS detection)
         public int  activeConnections;
+        /** pg_stat_database.blks_read snapshot taken immediately before query execution. */
+        public long blksReadBefore;
+        /** pg_stat_database.blks_read snapshot taken immediately after query execution. */
+        public long blksReadAfter;
 
         public TelemetryResult(long latencyMs, long execTimeMs,
-                               long waitTimeMs, int activeConnections) {
+                               long waitTimeMs, int activeConnections,
+                               long blksReadBefore, long blksReadAfter) {
             this.latencyMs         = latencyMs;
             this.execTimeMs        = execTimeMs;
             this.waitTimeMs        = waitTimeMs;
             this.activeConnections = activeConnections;
+            this.blksReadBefore    = blksReadBefore;
+            this.blksReadAfter     = blksReadAfter;
         }
     }
 }
