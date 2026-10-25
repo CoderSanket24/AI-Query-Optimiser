@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
-import { executeQuery, fetchSummary, fetchHistory, fetchPpoStats, fetchAnomalyStatus } from './api/api'
+import { executeQuery, fetchSummary, fetchHistory, fetchImprovement, fetchPpoStats, fetchAnomalyStatus } from './api/api'
 import './App.css'
 
 const PILL_CLASSES = ['pill-1', 'pill-2', 'pill-3', 'pill-4']
@@ -90,7 +90,7 @@ function QueryRunner() {
             <div className="result-row" style={{ marginBottom: 12 }}>
               <span className="label">Join Order</span>
               <div className="order-pills">
-                {(result.choosen_order || []).map((t, i) => (
+                {(result.chosen_order || []).map((t, i) => (
                   <span key={t} className={`pill ${PILL_CLASSES[i % 4]}`}>{i + 1}. {t}</span>
                 ))}
               </div>
@@ -129,7 +129,7 @@ function Dashboard() {
     try {
       const [s, imp, p] = await Promise.all([
         fetchSummary(),
-        fetch('/api/analytics/improvement?n=50').then(r => r.json()),
+        fetchImprovement(50),
         fetchPpoStats(),
       ])
       setSummary(s)
