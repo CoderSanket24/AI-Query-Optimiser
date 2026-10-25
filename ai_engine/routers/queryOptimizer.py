@@ -125,7 +125,7 @@ async def optimize_query(state: QueryState):
     return {
         "status":          "success",
         "optimized_query": final_sql,
-        "choosen_order":   optimized_order,
+        "chosen_order":    optimized_order,
         "xai_explanation": xai_explanation,
         "query_id":        rec.query_id,
         "hint_applied":    hint_allowed and len(optimized_order) > 1,

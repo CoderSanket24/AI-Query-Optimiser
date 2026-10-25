@@ -116,3 +116,25 @@ async def improvement(n: int = QParam(default=20, ge=2, le=200)):
         "delta":        round(rewards[-1] - rewards[0], 4) if len(rewards) >= 2 else 0,
         "points":     points,
     }
+
+
+@router.get("/rewards")
+async def rewards():
+    """
+    Returns the raw per-query reward list in chronological order.
+    Proxied by Spring Boot's AnalyticsController as /api/analytics/rewards.
+    """
+    records = get_all()
+    completed = [r for r in records if r.reward != 0.0]
+    return {
+        "total": len(completed),
+        "rewards": [
+            {
+                "query_id":   r.query_id,
+                "timestamp":  r.timestamp,
+                "reward":     r.reward,
+                "latency_ms": r.latency_ms,
+            }
+            for r in completed
+        ],
+    }

@@ -31,17 +31,19 @@ Caching:
 """
 
 import math
+import os
 import time
 import psycopg2
 import torch
 
-# DB connection config (matches application.properties)
+# DB connection config — overridable via environment variables (defaults match
+# application.properties for local development).
 _DB_CONFIG = {
-    "host":     "localhost",
-    "port":     5432,
-    "dbname":   "ai_optimizer",
-    "user":     "postgres",
-    "password": "password",
+    "host":     os.environ.get("DB_HOST",     "localhost"),
+    "port":     int(os.environ.get("DB_PORT", "5432")),
+    "dbname":   os.environ.get("DB_NAME",     "ai_optimizer"),
+    "user":     os.environ.get("DB_USERNAME", "postgres"),
+    "password": os.environ.get("DB_PASSWORD", "password"),
 }
 
 # TTL cache: key = table_name, value = (timestamp, stats_dict)
