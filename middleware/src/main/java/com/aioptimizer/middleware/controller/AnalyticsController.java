@@ -3,6 +3,7 @@ package com.aioptimizer.middleware.controller;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.client.RestTemplate;
 
@@ -20,6 +21,7 @@ import java.util.Map;
  * Endpoints proxied:
  *   GET /api/analytics/summary     -> FastAPI /analytics/summary
  *   GET /api/analytics/history     -> FastAPI /analytics/history
+ *   GET /api/analytics/improvement -> FastAPI /analytics/improvement
  *   GET /api/analytics/rewards     -> FastAPI /analytics/rewards
  *   GET /api/analytics/ppo/stats   -> FastAPI /feedback/stats
  *   GET /api/analytics/anomaly     -> FastAPI /anomaly/status
@@ -45,6 +47,17 @@ public class AnalyticsController {
     public ResponseEntity<?> getHistory() {
         try {
             ResponseEntity<Map> res = restTemplate.getForEntity(FASTAPI_BASE + "/analytics/history", Map.class);
+            return ResponseEntity.ok(res.getBody());
+        } catch (Exception e) {
+            return ResponseEntity.status(503).body("FastAPI unavailable: " + e.getMessage());
+        }
+    }
+
+    @GetMapping("/improvement")
+    public ResponseEntity<?> getImprovement(@RequestParam(defaultValue = "20") int n) {
+        try {
+            ResponseEntity<Map> res = restTemplate.getForEntity(
+                    FASTAPI_BASE + "/analytics/improvement?n=" + n, Map.class);
             return ResponseEntity.ok(res.getBody());
         } catch (Exception e) {
             return ResponseEntity.status(503).body("FastAPI unavailable: " + e.getMessage());

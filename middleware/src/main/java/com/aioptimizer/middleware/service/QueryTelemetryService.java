@@ -44,7 +44,7 @@ public class QueryTelemetryService {
      * 10 seconds is generous for the IMDB benchmark queries; reduce for stricter
      * enforcement.  Set to 0 to disable (not recommended with stochastic hints).
      */
-    public static final int STATEMENT_TIMEOUT_MS = 10_000;
+    public static final int STATEMENT_TIMEOUT_MS = 50_000;
 
     @Autowired
     private JdbcTemplate jdbcTemplate;

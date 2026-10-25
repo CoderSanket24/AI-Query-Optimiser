@@ -119,7 +119,7 @@ public class QueryController {
             ResponseEntity<Map> aiResponse = restTemplate.postForEntity(pythonAiUrl, pythonPayload, Map.class);
 
             String       optimizedSql = (String)       aiResponse.getBody().get("optimized_query");
-            List<String> chosenOrder  = (List<String>) aiResponse.getBody().get("choosen_order");
+            List<String> chosenOrder  = (List<String>) aiResponse.getBody().get("chosen_order");
 
             // Extract query_id only — log_prob_old is stored server-side.
             Object  queryIdObj = aiResponse.getBody().get("query_id");
