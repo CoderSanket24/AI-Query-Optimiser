@@ -26,7 +26,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  *   JOINSENSE_TEST_DB_PASSWORD (default: "")
  *
  * Three acceptance criteria from item 1.1:
- *   1. SELECT pg_sleep(30) is cancelled near the configured timeout — not after 30 s.
+ *   1. SELECT pg_sleep(120) is cancelled near STATEMENT_TIMEOUT_MS — not after 120 s.
  *   2. A normal query (SELECT 1) completes with a recorded exec time.
  *   3. After executeAndTrack() returns, the pooled connection's statement_timeout
  *      is back to the server's configured default (verified via SHOW statement_timeout).
@@ -85,7 +85,8 @@ class QueryTelemetryServiceIntegrationTest {
     }
 
     /**
-     * Acceptance criterion 1: pg_sleep(30) must be cancelled before 30 seconds.
+     * Acceptance criterion 1: pg_sleep(120) must be cancelled near
+     * STATEMENT_TIMEOUT_MS — not after 120 s.
      * execTimeMs must be EXEC_TIME_MISSING, and the whole call must return well
      * within the sleep duration.
      */
@@ -96,21 +97,21 @@ class QueryTelemetryServiceIntegrationTest {
 
         // executeAndTrack must NOT throw — it logs and returns EXEC_TIME_MISSING
         QueryTelemetryService.TelemetryResult result =
-            assertDoesNotThrow(() -> svc.executeAndTrack("SELECT pg_sleep(30)"),
+            assertDoesNotThrow(() -> svc.executeAndTrack("SELECT pg_sleep(120)"),
                 "executeAndTrack must not propagate the cancellation exception");
 
         long elapsedMs = (System.nanoTime() - startNs) / 1_000_000L;
-        System.out.println("[IT] pg_sleep(30) elapsed: " + elapsedMs + " ms");
+        System.out.println("[IT] pg_sleep(120) elapsed: " + elapsedMs + " ms");
 
         assertEquals(QueryTelemetryService.EXEC_TIME_MISSING, result.execTimeMs,
             "Cancelled query must report EXEC_TIME_MISSING (-1)");
 
-        // Must complete well before the 30-second sleep duration.
-        // We allow 3× the configured timeout as a generous bound for CI slowness.
+        // Must complete well before the 120-second sleep duration.
+        // We allow 3× STATEMENT_TIMEOUT_MS as a generous bound for CI slowness.
         long maxAcceptableMs = (long) QueryTelemetryService.STATEMENT_TIMEOUT_MS * 3L;
         assertTrue(elapsedMs < maxAcceptableMs,
             "Call took " + elapsedMs + " ms; expected < " + maxAcceptableMs
-            + " ms (3× configured timeout)");
+            + " ms (3× STATEMENT_TIMEOUT_MS)");
     }
 
     /**

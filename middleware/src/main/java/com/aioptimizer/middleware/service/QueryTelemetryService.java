@@ -40,9 +40,10 @@ public class QueryTelemetryService {
     public static final long EXEC_TIME_MISSING = -1L;
 
     /**
-     * Maximum wall-clock time allowed for a single query.
-     * 10 seconds is generous for the IMDB benchmark queries; reduce for stricter
-     * enforcement.  Set to 0 to disable (not recommended with stochastic hints).
+     * Maximum wall-clock time allowed for a single query, in milliseconds.
+     * STATEMENT_TIMEOUT_MS is generous for the IMDB benchmark queries; reduce
+     * for stricter enforcement.  Set to 0 to disable (not recommended with
+     * stochastic hints).
      */
     public static final int STATEMENT_TIMEOUT_MS = 50_000;
 
