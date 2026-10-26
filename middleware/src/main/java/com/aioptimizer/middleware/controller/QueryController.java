@@ -14,6 +14,7 @@ import org.springframework.web.client.RestTemplate;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
@@ -63,16 +64,23 @@ public class QueryController {
                 return ResponseEntity.badRequest().body("ERROR: SQL query cannot be empty.");
             }
 
+            // Total-latency timer — starts after input validation, covers all business logic.
+            long _totalStart = System.nanoTime();
+
             // Step 3: Firewall check on the ORIGINAL SQL
             System.out.println("3. Sending to Firewall...");
+            long _fw0 = System.nanoTime();
             astFirewall.inspectQuery(sql);
+            double firewallMs = (System.nanoTime() - _fw0) / 1e6;
 
             // Step 4: Extract alias→realName pairs AND join edges from AST.
             //   alias    = identifier pg_hint_plan sees in the SQL  (used for hints)
             //   realName = physical table name                       (used for schema stats)
             //   edges    = list of "leftAlias,rightAlias" strings   (join graph for Python)
             System.out.println("4. Firewall passed! Extracting table refs and join edges...");
+            long _ex0 = System.nanoTime();
             QueryFeatureExtractor.ExtractionResult extraction = extractor.extract(sql);
+            double extractMs = (System.nanoTime() - _ex0) / 1e6;
 
             List<String> aliases   = extraction.tableRefs.stream()
                                                           .map(r -> r.alias)
@@ -116,7 +124,9 @@ public class QueryController {
             pythonPayload.put("aliases_safe",    aliasesAreSafe);
 
             String pythonAiUrl = "http://localhost:8000/optimize";
+            long _oh0 = System.nanoTime();
             ResponseEntity<Map> aiResponse = restTemplate.postForEntity(pythonAiUrl, pythonPayload, Map.class);
+            double optimizeHttpMs = (System.nanoTime() - _oh0) / 1e6;
 
             String       optimizedSql = (String)       aiResponse.getBody().get("optimized_query");
             List<String> chosenOrder  = (List<String>) aiResponse.getBody().get("chosen_order");
@@ -124,6 +134,13 @@ public class QueryController {
             // Extract query_id only — log_prob_old is stored server-side.
             Object  queryIdObj = aiResponse.getBody().get("query_id");
             Integer queryId    = (queryIdObj instanceof Number) ? ((Number) queryIdObj).intValue() : null;
+
+            // Extract /optimize server timings (null-safe — absent on older server versions).
+            Map<?, ?> optimizeTimings = null;
+            Object otObj = aiResponse.getBody().get("server_timings_ms");
+            if (otObj instanceof Map<?, ?>) {
+                optimizeTimings = (Map<?, ?>) otObj;
+            }
 
             // Step 6: Execute query under statement_timeout guard
             QueryTelemetryService.TelemetryResult metrics = queryTelemetryService.executeAndTrack(optimizedSql);
@@ -140,7 +157,11 @@ public class QueryController {
             System.out.printf("CO₂:          %.4f g  (energy: %.6f kWh)%n",
                               carbon.co2Grams, carbon.energyKwh);
 
-            // Step 7: Send feedback — log_prob_old NOT forwarded (read from server-side store)
+            // Step 7: Send feedback — log_prob_old NOT forwarded (read from server-side store).
+            // feedbackHttpMs and feedbackTimings declared outside the try so they are
+            // accessible when building the breakdown map below.
+            double  feedbackHttpMs = 0.0;
+            Map<?, ?> feedbackTimings = null;
             try {
                 Map<String, Object> feedbackPayload = new HashMap<>();
                 feedbackPayload.put("tables",             aliases);
@@ -153,7 +174,16 @@ public class QueryController {
                 if (queryId != null) feedbackPayload.put("query_id", queryId);
 
                 String feedbackUrl = "http://localhost:8000/feedback";
+                long _fh0 = System.nanoTime();
                 ResponseEntity<Map> feedbackResponse = restTemplate.postForEntity(feedbackUrl, feedbackPayload, Map.class);
+                feedbackHttpMs = (System.nanoTime() - _fh0) / 1e6;
+
+                if (feedbackResponse.getBody() != null) {
+                    Object ftObj = feedbackResponse.getBody().get("server_timings_ms");
+                    if (ftObj instanceof Map<?, ?>) {
+                        feedbackTimings = (Map<?, ?>) ftObj;
+                    }
+                }
 
                 Object reward     = feedbackResponse.getBody().get("reward");
                 Object bufferSize = feedbackResponse.getBody().get("buffer_size");
@@ -168,18 +198,89 @@ public class QueryController {
                 System.out.println("Warning: Feedback failed: " + feedbackEx.getMessage());
             }
 
-            // Step 8: Return enriched response (latency + carbon fields)
+            // Step 8: Build latency_breakdown_ms — all Java-side stages, server timings
+            // from /optimize and /feedback, and derived fields.
+            double totalMs = (System.nanoTime() - _totalStart) / 1e6;
+
+            // LinkedHashMap preserves insertion order in JSON for readability.
+            Map<String, Object> breakdown = new LinkedHashMap<>();
+
+            // ── Java-side stages ──────────────────────────────────────────────
+            breakdown.put("firewall_ms",           firewallMs);
+            breakdown.put("extract_ms",            extractMs);
+            breakdown.put("optimize_http_ms",      optimizeHttpMs);
+            breakdown.put("active_conn_query_ms",  metrics.activeConnQueryMs);
+            breakdown.put("pool_wait_ms",          (double) metrics.waitTimeMs);
+            breakdown.put("blks_before_query_ms",  metrics.blksBeforeQueryMs);
+            breakdown.put("set_timeout_ms",        metrics.setTimeoutMs);
+            breakdown.put("explain_call_ms",       metrics.explainCallMs);
+            // exec_time_ms_gap = how much execTimeMs overshoots explain_call_ms
+            // (i.e. the cost of SET + blks_before that fall inside execStart's window).
+            double execGap = (metrics.execTimeMs == QueryTelemetryService.EXEC_TIME_MISSING)
+                ? -1.0
+                : ((double) metrics.execTimeMs - metrics.explainCallMs);
+            breakdown.put("exec_time_ms_gap",      execGap);
+            breakdown.put("blks_after_query_ms",   metrics.blksAfterQueryMs);
+            breakdown.put("reset_ms",              metrics.resetMs);
+            breakdown.put("feedback_http_ms",      feedbackHttpMs);
+            breakdown.put("total_ms",              totalMs);
+
+            // ── /optimize server timings (prefixed "opt_") ────────────────────
+            if (optimizeTimings != null) {
+                for (Map.Entry<?, ?> e : optimizeTimings.entrySet()) {
+                    breakdown.put("opt_" + e.getKey(), e.getValue());
+                }
+            }
+
+            // ── /feedback server timings (prefixed "fb_") ─────────────────────
+            if (feedbackTimings != null) {
+                for (Map.Entry<?, ?> e : feedbackTimings.entrySet()) {
+                    breakdown.put("fb_" + e.getKey(), e.getValue());
+                }
+            }
+
+            // ── Derived fields ────────────────────────────────────────────────
+            // unaccounted_ms = total - sum of all named stage timers.
+            // Captures: JSON parsing, Spring overhead, response building, etc.
+            // NOTE: explain_call_ms is used, NOT exec_time_ms, to avoid double-counting.
+            double sumStages = firewallMs + extractMs + optimizeHttpMs
+                + metrics.activeConnQueryMs + (double) metrics.waitTimeMs
+                + metrics.blksBeforeQueryMs + metrics.setTimeoutMs + metrics.explainCallMs
+                + metrics.blksAfterQueryMs + metrics.resetMs + feedbackHttpMs;
+            breakdown.put("unaccounted_ms", totalMs - sumStages);
+
+            // optimize_hop_overhead_ms = round-trip HTTP cost minus server processing time.
+            if (optimizeTimings != null) {
+                Object srvOptObj = optimizeTimings.get("optimize_total");
+                if (srvOptObj instanceof Number) {
+                    breakdown.put("optimize_hop_overhead_ms",
+                        optimizeHttpMs - ((Number) srvOptObj).doubleValue());
+                }
+            }
+
+            // feedback_hop_overhead_ms = same concept for /feedback.
+            if (feedbackTimings != null) {
+                Object srvFbObj = feedbackTimings.get("feedback_total");
+                if (srvFbObj instanceof Number) {
+                    breakdown.put("feedback_hop_overhead_ms",
+                        feedbackHttpMs - ((Number) srvFbObj).doubleValue());
+                }
+            }
+
+            // Step 9: Return enriched response (latency + carbon + breakdown fields)
             Map<String, Object> finalResponse = new HashMap<>(aiResponse.getBody());
-            finalResponse.put("latency_ms",        metrics.latencyMs);
-            finalResponse.put("exec_time_ms",       metrics.execTimeMs);
-            finalResponse.put("wait_time_ms",       metrics.waitTimeMs);
-            finalResponse.put("active_connections", metrics.activeConnections);
-            finalResponse.put("aliases_safe",       aliasesAreSafe);
+            finalResponse.put("latency_ms",            metrics.latencyMs);
+            finalResponse.put("exec_time_ms",          metrics.execTimeMs);
+            finalResponse.put("wait_time_ms",          metrics.waitTimeMs);
+            finalResponse.put("active_connections",    metrics.activeConnections);
+            finalResponse.put("aliases_safe",          aliasesAreSafe);
             // Carbon pillar fields
-            finalResponse.put("co2_grams",          carbon.co2Grams);
-            finalResponse.put("energy_kwh",         carbon.energyKwh);
-            finalResponse.put("cpu_energy_kwh",     carbon.cpuEnergyKwh);
-            finalResponse.put("io_energy_kwh",      carbon.ioEnergyKwh);
+            finalResponse.put("co2_grams",             carbon.co2Grams);
+            finalResponse.put("energy_kwh",            carbon.energyKwh);
+            finalResponse.put("cpu_energy_kwh",        carbon.cpuEnergyKwh);
+            finalResponse.put("io_energy_kwh",         carbon.ioEnergyKwh);
+            // Latency breakdown (all stages + server timings + derived)
+            finalResponse.put("latency_breakdown_ms",  breakdown);
 
             return ResponseEntity.ok(finalResponse);
 

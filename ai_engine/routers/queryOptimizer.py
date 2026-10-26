@@ -19,8 +19,18 @@ Bug fixes applied
                        tables connected to the current prefix — no cross-products.
 6. Alias injection   : aliases_safe=False (set by Java whitelist check) forces the
                        hint to be omitted entirely; original SQL runs unhinted.
+
+Per-stage latency instrumentation
+----------------------------------
+server_timings_ms keys (all fractional ms via time.perf_counter()):
+  vectorize       -- build_state_tensor() (schema stats fetch + tensor build)
+  sample          -- trainer.sample_action() (PPO forward + categorical sample)
+  attention       -- ai_model forward pass for XAI weights (torch.no_grad())
+  hint_build      -- _nested_leading() + final SQL assembly
+  optimize_total  -- entire endpoint wall-clock (superset of the above)
 """
 
+import time
 import re
 from fastapi import APIRouter
 from models.model import QueryState
@@ -61,6 +71,8 @@ def _nested_leading(order: list[str]) -> str:
 
 @router.post("/optimize")
 async def optimize_query(state: QueryState):
+    _opt_start = time.perf_counter()
+
     # aliases    → identifiers pg_hint_plan matches in the SQL
     # stat_names → physical table names for schema statistics
     aliases         = state.tables
@@ -71,18 +83,24 @@ async def optimize_query(state: QueryState):
           f"Edges={join_conditions}  AliasesSafe={state.aliases_safe}")
 
     # 1. Build state tensor using REAL table names (accurate schema stats)
+    _t0 = time.perf_counter()
     state_tensor = build_state_tensor(stat_names)
+    vectorize_ms = (time.perf_counter() - _t0) * 1000.0
 
     # 2. Graph-aware stochastic sampling.
     #    sample_action() respects join_conditions so every step in the sampled
     #    order is connected to the already-placed prefix — no cross-products.
+    _t0 = time.perf_counter()
     optimized_order, log_prob_old = trainer.sample_action(
         state_tensor, aliases, join_conditions)
+    sample_ms = (time.perf_counter() - _t0) * 1000.0
 
     # 3. XAI explanation (no gradient needed)
     import torch
+    _t0 = time.perf_counter()
     with torch.no_grad():
         _, attention_weights = ai_model(state_tensor)
+    attention_ms = (time.perf_counter() - _t0) * 1000.0
     xai_explanation = {
         alias: round(attention_weights[i].item() * 100, 2)
         for i, alias in enumerate(aliases)
@@ -93,6 +111,7 @@ async def optimize_query(state: QueryState):
     #    Java already set aliases_safe=False and logged the offending aliases;
     #    we honour that flag here regardless of _aliases_safe() result so a
     #    misconfigured Java side cannot bypass the check.
+    _t0 = time.perf_counter()
     hint_allowed = state.aliases_safe and _aliases_safe(aliases)
     if hint_allowed and len(optimized_order) > 1:
         leading_expr = _nested_leading(optimized_order)
@@ -102,6 +121,7 @@ async def optimize_query(state: QueryState):
         final_sql = state.original_sql
         if not hint_allowed:
             print("[SECURITY] Hint suppressed — unsafe alias(es) detected.")
+    hint_build_ms = (time.perf_counter() - _t0) * 1000.0
 
     # 5. Create pending analytics record (outcome filled by /feedback)
     rec = new_record(
@@ -122,6 +142,8 @@ async def optimize_query(state: QueryState):
         join_conditions = join_conditions,
     )
 
+    optimize_total_ms = (time.perf_counter() - _opt_start) * 1000.0
+
     return {
         "status":          "success",
         "optimized_query": final_sql,
@@ -130,4 +152,11 @@ async def optimize_query(state: QueryState):
         "query_id":        rec.query_id,
         "hint_applied":    hint_allowed and len(optimized_order) > 1,
         # log_prob_old intentionally NOT returned — stored server-side only
+        "server_timings_ms": {
+            "vectorize":      round(vectorize_ms,      3),
+            "sample":         round(sample_ms,         3),
+            "attention":      round(attention_ms,      3),
+            "hint_build":     round(hint_build_ms,     3),
+            "optimize_total": round(optimize_total_ms, 3),
+        },
     }

@@ -19,6 +19,10 @@ import java.sql.Statement;
  *   exec_time_ms  -- time PostgreSQL spends actually running the query.
  *                    Uses System.nanoTime() so fast queries do NOT round to 0.
  *                    -1 = EXEC_TIME_MISSING sentinel.
+ *                    NOTE: exec_time_ms starts before SET statement_timeout and
+ *                    blks_before_query, so exec_time_ms > explain_call_ms.
+ *                    The gap (exec_time_ms - explain_call_ms) ≈ SET + blks_before
+ *                    overhead — reported in latency_breakdown_ms as exec_time_ms_gap.
  *
  *   latency_ms    -- total wall-clock time (wait + exec), kept for compatibility.
  *
@@ -32,6 +36,16 @@ import java.sql.Statement;
  *   a finally block BEFORE conn.close() so the connection is clean when it returns
  *   to the pool.  If RESET fails, Connection.abort() is called so HikariCP evicts
  *   the dirty connection rather than recycling it.
+ *
+ * Per-stage latency instrumentation (fractional ms, double):
+ *   active_conn_query_ms -- time for pg_stat_activity count query
+ *   pool_wait_ms         -- same as waitTimeMs (int→double alias for breakdown)
+ *   set_timeout_ms       -- time to execute SET statement_timeout
+ *   blks_before_query_ms -- time to snapshot pg_stat_database.blks_read before query
+ *   explain_call_ms      -- time of the EXPLAIN ANALYZE call only (recorded on cancel)
+ *   blks_after_query_ms  -- time to snapshot pg_stat_database.blks_read after query
+ *   reset_ms             -- time to execute RESET statement_timeout
+ *   WARNING logged if blks_before or blks_after query takes > 100 ms.
  */
 @Service
 public class QueryTelemetryService {
@@ -55,51 +69,98 @@ public class QueryTelemetryService {
 
     public TelemetryResult executeAndTrack(String finalSql) throws Exception {
 
-        // 1. Count active connections BEFORE execution (baseline load snapshot)
+        // 1. Count active connections BEFORE execution (baseline load snapshot).
+        //    Timed separately so the cost of this query is visible in the breakdown.
         String contentionQuery =
             "SELECT count(*) FROM pg_stat_activity WHERE state = 'active';";
+        long _acqT0 = System.nanoTime();
         Integer activeConnections =
             jdbcTemplate.queryForObject(contentionQuery, Integer.class);
+        double activeConnQueryMs = (System.nanoTime() - _acqT0) / 1e6;
 
-        // 2. Measure wait_time: time to acquire connection from HikariCP pool.
+        // 2. Measure pool_wait_ms: time to acquire connection from HikariCP pool.
         long waitStart = System.nanoTime();
         Connection conn = dataSource.getConnection();
         long waitTimeMs = (System.nanoTime() - waitStart) / 1_000_000L;
 
-        long execStart    = System.nanoTime();
-        long execTimeMs   = EXEC_TIME_MISSING;
+        // execStart is captured BEFORE SET so exec_time_ms includes set + blks_before.
+        // The gap (exec_time_ms - explain_call_ms) reveals that overhead.
+        long execStart      = System.nanoTime();
+        long execTimeMs     = EXEC_TIME_MISSING;
         long blksReadBefore = 0L;
         long blksReadAfter  = 0L;
+
+        // Per-stage timer accumulators (fractional ms, set onto result after construction).
+        double setTimeoutMs      = 0.0;
+        double explainCallMs     = 0.0;
+        double blksBeforeQueryMs = 0.0;
+        double blksAfterQueryMs  = 0.0;
+        double resetMs           = 0.0;
 
         try {
             // 3. Execute under statement_timeout guard.
             //    SET (session-scoped) works on autocommit connections.
             //    SET LOCAL outside a transaction block has no effect (PostgreSQL §20.1).
             try (Statement stmt = conn.createStatement()) {
+
+                // SET statement_timeout — timed separately from EXPLAIN ANALYZE.
                 if (STATEMENT_TIMEOUT_MS > 0) {
+                    long _st0 = System.nanoTime();
                     stmt.execute("SET statement_timeout = '" + STATEMENT_TIMEOUT_MS + "ms'");
+                    setTimeoutMs = (System.nanoTime() - _st0) / 1e6;
                 }
+
                 // Snapshot I/O counters before the query runs.
+                long _bb0 = System.nanoTime();
                 blksReadBefore = queryBlksRead();
+                blksBeforeQueryMs = (System.nanoTime() - _bb0) / 1e6;
+                if (blksBeforeQueryMs > 100.0) {
+                    System.out.printf(
+                        "[Telemetry] WARNING: blks_before_query_ms=%.1f ms (> 100 ms threshold)%n",
+                        blksBeforeQueryMs);
+                }
 
-                stmt.execute("EXPLAIN ANALYZE " + finalSql);
-                execTimeMs = (System.nanoTime() - execStart) / 1_000_000L;
+                // EXPLAIN ANALYZE — timed via its own nested try/finally so that
+                // explain_call_ms is recorded even when the query is cancelled.
+                // execTimeMs stays EXEC_TIME_MISSING on cancellation.
+                long _explainStart = System.nanoTime();
+                try {
+                    stmt.execute("EXPLAIN ANALYZE " + finalSql);
+                    execTimeMs = (System.nanoTime() - execStart) / 1_000_000L;
+                } catch (Exception queryEx) {
+                    // Timeout (SQLState 57014) or any other query error.
+                    // execTimeMs stays EXEC_TIME_MISSING; feedback.py skips reward.
+                    System.out.println("[Telemetry] Query failed/cancelled"
+                        + " (SQLState=" + sqlStateOf(queryEx) + "): " + queryEx.getMessage());
+                } finally {
+                    // Always captured — gives the actual EXPLAIN wall-clock even on cancel.
+                    explainCallMs = (System.nanoTime() - _explainStart) / 1e6;
+                }
 
-            } catch (Exception queryEx) {
-                // Timeout (SQLState 57014) or any other query error.
-                // execTimeMs stays EXEC_TIME_MISSING; feedback.py skips reward.
-                System.out.println("[Telemetry] Query failed/cancelled"
-                    + " (SQLState=" + sqlStateOf(queryEx) + "): " + queryEx.getMessage());
+            } catch (Exception outerEx) {
+                // Catches SET statement_timeout failures or blks_before query errors.
+                // EXPLAIN errors are caught by the inner try/catch above.
+                System.out.println("[Telemetry] Query execution error"
+                    + " (SQLState=" + sqlStateOf(outerEx) + "): " + outerEx.getMessage());
 
             } finally {
                 // Snapshot I/O counters after the query finishes (or is cancelled).
+                long _ba0 = System.nanoTime();
                 blksReadAfter = queryBlksRead();
+                blksAfterQueryMs = (System.nanoTime() - _ba0) / 1e6;
+                if (blksAfterQueryMs > 100.0) {
+                    System.out.printf(
+                        "[Telemetry] WARNING: blks_after_query_ms=%.1f ms (> 100 ms threshold)%n",
+                        blksAfterQueryMs);
+                }
 
                 // Always RESET before returning the connection to the pool —
                 // whether the query succeeded, timed out, or failed for another reason.
                 // A fresh Statement is needed because the prior one was closed by TWR.
                 if (STATEMENT_TIMEOUT_MS > 0) {
+                    long _rt0 = System.nanoTime();
                     resetTimeout(conn);
+                    resetMs = (System.nanoTime() - _rt0) / 1e6;
                 }
             }
         } finally {
@@ -110,13 +171,26 @@ public class QueryTelemetryService {
         }
 
         long latencyMs = waitTimeMs + (execTimeMs == EXEC_TIME_MISSING ? 0 : execTimeMs);
-        System.out.println("[Telemetry] wait=" + waitTimeMs + "ms"
-            + "  exec=" + (execTimeMs == EXEC_TIME_MISSING ? "CANCELLED" : execTimeMs + "ms")
-            + "  total=" + latencyMs + "ms"
-            + "  connections=" + activeConnections
-            + "  blks_read_delta=" + (blksReadAfter - blksReadBefore));
-        return new TelemetryResult(latencyMs, execTimeMs, waitTimeMs, activeConnections,
-                                   blksReadBefore, blksReadAfter);
+        System.out.printf(
+            "[Telemetry] wait=%dms  exec=%s  explain_call=%.1fms  total=%dms"
+            + "  conn=%d  blks_delta=%d%n",
+            waitTimeMs,
+            execTimeMs == EXEC_TIME_MISSING ? "CANCELLED" : execTimeMs + "ms",
+            explainCallMs,
+            latencyMs,
+            activeConnections,
+            blksReadAfter - blksReadBefore);
+
+        // Constructor signature is unchanged — new fields are set as public mutables.
+        TelemetryResult result = new TelemetryResult(latencyMs, execTimeMs, waitTimeMs,
+                                                     activeConnections, blksReadBefore, blksReadAfter);
+        result.activeConnQueryMs = activeConnQueryMs;
+        result.setTimeoutMs      = setTimeoutMs;
+        result.explainCallMs     = explainCallMs;
+        result.blksBeforeQueryMs = blksBeforeQueryMs;
+        result.blksAfterQueryMs  = blksAfterQueryMs;
+        result.resetMs           = resetMs;
+        return result;
     }
 
     /**
@@ -181,6 +255,25 @@ public class QueryTelemetryService {
         public long blksReadBefore;
         /** pg_stat_database.blks_read snapshot taken immediately after query execution. */
         public long blksReadAfter;
+
+        // Per-stage latency fields (fractional ms). Set by executeAndTrack() after
+        // construction so the constructor signature remains unchanged.
+        /** Time to query pg_stat_activity for active connection count. */
+        public double activeConnQueryMs;
+        /** Time to execute SET statement_timeout (session-scoped). */
+        public double setTimeoutMs;
+        /**
+         * Wall-clock time of the EXPLAIN ANALYZE call only — recorded even when the
+         * query is cancelled.  The gap (execTimeMs - explainCallMs) reveals the
+         * overhead of SET + blks_before that is included in execTimeMs's start point.
+         */
+        public double explainCallMs;
+        /** Time to query pg_stat_database.blks_read before EXPLAIN ANALYZE. */
+        public double blksBeforeQueryMs;
+        /** Time to query pg_stat_database.blks_read after EXPLAIN ANALYZE (or cancel). */
+        public double blksAfterQueryMs;
+        /** Time to execute RESET statement_timeout on the recycled connection. */
+        public double resetMs;
 
         public TelemetryResult(long latencyMs, long execTimeMs,
                                long waitTimeMs, int activeConnections,

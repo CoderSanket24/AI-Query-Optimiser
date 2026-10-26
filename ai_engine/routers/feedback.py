@@ -36,11 +36,24 @@ POST /feedback
     so it cannot be tampered with.  The payload field `log_prob_old` has been
     removed; the condition now only checks query_id.
 
+Per-stage latency instrumentation
+----------------------------------
+server_timings_ms keys (all fractional ms via time.perf_counter()):
+  anomaly_predict  -- detector.predict() call
+  training         -- trainer.train_batch() or trainer.train_step() call only
+                      (0.0 when training is skipped or batch is still accumulating)
+  checkpoint_save  -- trainer.save_checkpoint() call only (separate from training)
+                      (0.0 when checkpoint is not saved this request)
+  analytics        -- complete_record() call
+  forest_refit     -- detector.fit() call only (0.0 when refit threshold not reached)
+  feedback_total   -- entire endpoint wall-clock (superset of the above)
+
 GET /feedback/stats   -- PPO + buffer + checkpoint state
 GET /feedback/buffer  -- raw replay buffer (debug)
 """
 
 import os
+import time
 import threading
 from collections import deque
 from fastapi import APIRouter
@@ -74,6 +87,8 @@ _forest_lock          = threading.Lock()
 
 @router.post("/feedback")
 async def receive_feedback(payload: FeedbackPayload):
+    _fb_start = time.perf_counter()
+
     # ── exec_ms resolution ───────────────────────────────────────────
     # exec_time_ms == EXEC_MISSING (-1) means the Java side could not measure it
     # (should be rare with nanoTime, but guard anyway).
@@ -85,10 +100,18 @@ async def receive_feedback(payload: FeedbackPayload):
     exec_is_missing = (exec_ms == EXEC_MISSING)
 
     # ── Step 1: Isolation Forest anomaly check ──────────────────────
+    _t0 = time.perf_counter()
     is_anomaly, anomaly_score = detector.predict(
         wait_time_ms       = wait_ms,
         active_connections = payload.active_connections,
     )
+    anomaly_predict_ms = (time.perf_counter() - _t0) * 1000.0
+
+    # Timer accumulators — set to 0.0 and overwritten only when the code path fires.
+    training_ms       = 0.0
+    checkpoint_save_ms = 0.0
+    analytics_ms      = 0.0
+    forest_refit_ms   = 0.0
 
     if is_anomaly:
         # DoS / bad query detected — zero reward, skip PPO.
@@ -107,6 +130,7 @@ async def receive_feedback(payload: FeedbackPayload):
 
         # Update analytics — mark as anomalous so history table is accurate
         if payload.query_id is not None:
+            _t0 = time.perf_counter()
             complete_record(
                 query_id           = payload.query_id,
                 latency_ms         = payload.latency_ms,
@@ -118,10 +142,12 @@ async def receive_feedback(payload: FeedbackPayload):
                 is_anomalous       = True,          # ← DoS detected
                 anomaly_score      = anomaly_score, # ← Forest score
             )
+            analytics_ms = (time.perf_counter() - _t0) * 1000.0
 
         # QUARANTINE: do NOT add flagged samples to _forest_samples.
         # Feeding anomalies back would teach the forest that attacks are normal.
 
+        feedback_total_ms = (time.perf_counter() - _fb_start) * 1000.0
         return {
             "status":           "received",
             "anomaly_detected": True,
@@ -131,6 +157,14 @@ async def receive_feedback(payload: FeedbackPayload):
             "training":         train_metrics,
             "ppo_batch_fired":  False,
             "forest_retrained": False,
+            "server_timings_ms": {
+                "anomaly_predict":  round(anomaly_predict_ms,  3),
+                "training":         0.0,
+                "checkpoint_save":  0.0,
+                "analytics":        round(analytics_ms,        3),
+                "forest_refit":     0.0,
+                "feedback_total":   round(feedback_total_ms,   3),
+            },
         }
 
     # ── Step 2: Normal query — compute reward using exec_time only ───
@@ -204,9 +238,14 @@ async def receive_feedback(payload: FeedbackPayload):
                     _ppo_batch.clear()
 
             if batch_ready:
-                train_metrics   = trainer.train_batch(batch_to_train)
+                _t0 = time.perf_counter()
+                train_metrics = trainer.train_batch(batch_to_train)
+                training_ms = (time.perf_counter() - _t0) * 1000.0
                 ppo_batch_fired = True
+
+                _t0 = time.perf_counter()
                 trainer.save_checkpoint()
+                checkpoint_save_ms = (time.perf_counter() - _t0) * 1000.0
             else:
                 with _ppo_batch_lock:
                     queued = len(_ppo_batch)
@@ -217,14 +256,25 @@ async def receive_feedback(payload: FeedbackPayload):
                 }
         else:
             # Pending entry expired or was never created → REINFORCE fallback
+            _t0 = time.perf_counter()
             train_metrics = trainer.train_step(experience)
+            training_ms = (time.perf_counter() - _t0) * 1000.0
+
+            _t0 = time.perf_counter()
             trainer.save_checkpoint()
+            checkpoint_save_ms = (time.perf_counter() - _t0) * 1000.0
     else:
+        _t0 = time.perf_counter()
         train_metrics = trainer.train_step(experience)
+        training_ms = (time.perf_counter() - _t0) * 1000.0
+
+        _t0 = time.perf_counter()
         trainer.save_checkpoint()
+        checkpoint_save_ms = (time.perf_counter() - _t0) * 1000.0
 
     # ── Step 4: Analytics ────────────────────────────────────────────
     if payload.query_id is not None:
+        _t0 = time.perf_counter()
         complete_record(
             query_id           = payload.query_id,
             latency_ms         = payload.latency_ms,
@@ -236,9 +286,16 @@ async def receive_feedback(payload: FeedbackPayload):
             is_anomalous       = False,          # confirmed normal by forest
             anomaly_score      = anomaly_score,  # forest score (positive = normal)
         )
+        analytics_ms = (time.perf_counter() - _t0) * 1000.0
 
     # ── Step 5: Forest refit (normal samples only) ───────────────────
-    forest_retrained = _accumulate_forest_sample(wait_ms, payload.active_connections)
+    # _accumulate_forest_sample returns (retrained: bool, refit_ms: float).
+    # detector.fit() is timed inside the helper; forest_refit_ms = 0.0 when
+    # the refit threshold has not been reached.
+    forest_retrained, forest_refit_ms = _accumulate_forest_sample(
+        wait_ms, payload.active_connections)
+
+    feedback_total_ms = (time.perf_counter() - _fb_start) * 1000.0
 
     return {
         "status":           "received",
@@ -251,18 +308,29 @@ async def receive_feedback(payload: FeedbackPayload):
         "training":         train_metrics,
         "ppo_batch_fired":  ppo_batch_fired,
         "forest_retrained": forest_retrained,
+        "server_timings_ms": {
+            "anomaly_predict":  round(anomaly_predict_ms,  3),
+            "training":         round(training_ms,         3),
+            "checkpoint_save":  round(checkpoint_save_ms,  3),
+            "analytics":        round(analytics_ms,        3),
+            "forest_refit":     round(forest_refit_ms,     3),
+            "feedback_total":   round(feedback_total_ms,   3),
+        },
     }
 
 
 def _accumulate_forest_sample(wait_ms: float,
-                               connections: int) -> bool:
+                               connections: int) -> tuple[bool, float]:
     """
     Add one [wait_ms, connections] sample to the forest buffer.
     Only NORMAL (non-anomalous) samples reach this function.
     exec_ms deliberately excluded — cannot be a DoS signal since
     exec_time can be high due to PPO's own suboptimal join order.
     Triggers refit when MIN_SAMPLES_TO_FIT reached, then every RETRAIN_EVERY_N.
-    Returns True if forest was retrained.
+
+    Returns (retrained: bool, forest_refit_ms: float).
+    forest_refit_ms is the wall-clock time of detector.fit() only; it is 0.0
+    when the refit threshold has not been reached this call.
     """
     sample = [wait_ms, float(connections)]
     with _forest_lock:
@@ -274,9 +342,12 @@ def _accumulate_forest_sample(wait_ms: float,
                   (n > MIN_SAMPLES_TO_FIT and (n - MIN_SAMPLES_TO_FIT) % RETRAIN_EVERY_N == 0))
 
     if should_fit and n >= MIN_SAMPLES_TO_FIT:
+        _t0 = time.perf_counter()
         detector.fit(samples)
-        return True
-    return False
+        refit_ms = (time.perf_counter() - _t0) * 1000.0
+        return True, refit_ms
+
+    return False, 0.0
 
 
 # ── Debug endpoints ──────────────────────────────────────────────────
