@@ -107,11 +107,11 @@ class QueryTelemetryServiceIntegrationTest {
             "Cancelled query must report EXEC_TIME_MISSING (-1)");
 
         // Must complete well before the 120-second sleep duration.
-        // We allow 3× STATEMENT_TIMEOUT_MS as a generous bound for CI slowness.
-        long maxAcceptableMs = (long) QueryTelemetryService.STATEMENT_TIMEOUT_MS * 3L;
+        // Allow 1.5× STATEMENT_TIMEOUT_MS for cancellation and cleanup overhead.
+        long maxAcceptableMs = (long) (QueryTelemetryService.STATEMENT_TIMEOUT_MS * 1.5);
         assertTrue(elapsedMs < maxAcceptableMs,
             "Call took " + elapsedMs + " ms; expected < " + maxAcceptableMs
-            + " ms (3× STATEMENT_TIMEOUT_MS)");
+            + " ms (1.5× STATEMENT_TIMEOUT_MS)");
     }
 
     /**

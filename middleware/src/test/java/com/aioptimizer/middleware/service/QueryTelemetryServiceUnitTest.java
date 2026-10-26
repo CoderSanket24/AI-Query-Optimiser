@@ -7,6 +7,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import javax.sql.DataSource;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
@@ -22,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * Uses JDK Proxy doubles for Connection/Statement/DataSource so no extra
  * dependencies (Mockito, etc.) are needed beyond JUnit 5 and spring-test.
  *
- * Four scenarios:
+ * Scenarios:
  *   1. Normal query  — SET issued, EXPLAIN succeeds, RESET issued, no abort.
  *   2. Query timeout — SET issued, EXPLAIN throws, RESET still issued, no abort.
  *   3. RESET fails   — EXPLAIN succeeds, RESET throws, abort() called.
@@ -61,12 +62,44 @@ class QueryTelemetryServiceUnitTest {
             });
     }
 
+    /** Returns a positional block-snapshot Statement, optionally delayed or failing. */
+    private Statement stubBlockStatement(List<String> log, boolean fail, long sleepMs) {
+        return (Statement) Proxy.newProxyInstance(
+            getClass().getClassLoader(),
+            new Class[]{Statement.class},
+            (proxy, method, args) -> {
+                if ("executeQuery".equals(method.getName())
+                        && args != null && args.length >= 1) {
+                    log.add((String) args[0]);
+                    if (sleepMs > 0) Thread.sleep(sleepMs);
+                    if (fail) throw new SQLException("Simulated snapshot failure", "08006");
+                    AtomicBoolean rowReturned = new AtomicBoolean(false);
+                    return Proxy.newProxyInstance(
+                        getClass().getClassLoader(),
+                        new Class[]{ResultSet.class},
+                        (rsProxy, rsMethod, rsArgs) -> switch (rsMethod.getName()) {
+                            case "next"    -> !rowReturned.getAndSet(true);
+                            case "getLong" -> 42L;
+                            default -> {
+                                Class<?> ret = rsMethod.getReturnType();
+                                yield (ret == boolean.class) ? Boolean.FALSE
+                                    : (ret == int.class) ? 0 : null;
+                            }
+                        });
+                }
+                Class<?> ret = method.getReturnType();
+                if (ret == boolean.class) return Boolean.FALSE;
+                if (ret == int.class) return 0;
+                return null;
+            });
+    }
+
     /**
      * Returns a Proxy Connection that hands out {@code stmts} in order from
      * createStatement(). Records abort() and close() calls.
      */
     private Connection stubConnection(AtomicBoolean abortCalled,
-                                      AtomicBoolean closeCalled,
+                                      AtomicInteger closeCalls,
                                       Statement... stmts) {
         AtomicInteger idx = new AtomicInteger(0);
         return (Connection) Proxy.newProxyInstance(
@@ -75,7 +108,7 @@ class QueryTelemetryServiceUnitTest {
             (proxy, method, args) -> switch (method.getName()) {
                 case "createStatement" -> stmts[idx.getAndIncrement()];
                 case "abort"           -> { abortCalled.set(true); yield null; }
-                case "close"           -> { closeCalled.set(true); yield null; }
+                case "close"           -> { closeCalls.incrementAndGet(); yield null; }
                 default -> {
                     Class<?> ret = method.getReturnType();
                     yield (ret == boolean.class) ? Boolean.FALSE : null;
@@ -85,11 +118,21 @@ class QueryTelemetryServiceUnitTest {
 
     /** Returns a Proxy DataSource whose getConnection() always returns conn. */
     private DataSource stubDataSource(Connection conn) {
+        return stubDataSource(conn, new AtomicInteger());
+    }
+
+    /** Returns a Proxy DataSource that counts calls to getConnection(). */
+    private DataSource stubDataSource(Connection conn, AtomicInteger getConnectionCalls) {
         return (DataSource) Proxy.newProxyInstance(
             getClass().getClassLoader(),
             new Class[]{DataSource.class},
-            (proxy, method, args) ->
-                "getConnection".equals(method.getName()) ? conn : null);
+            (proxy, method, args) -> {
+                if ("getConnection".equals(method.getName())) {
+                    getConnectionCalls.incrementAndGet();
+                    return conn;
+                }
+                return null;
+            });
     }
 
     /**
@@ -124,13 +167,16 @@ class QueryTelemetryServiceUnitTest {
     @Test
     void normalQuery_setThenExplainThenReset_noAbort() throws Exception {
         List<String> mainLog  = new ArrayList<>();
+        List<String> blocksLog = new ArrayList<>();
         List<String> resetLog = new ArrayList<>();
         AtomicBoolean abortCalled = new AtomicBoolean(false);
-        AtomicBoolean closeCalled = new AtomicBoolean(false);
+        AtomicInteger closeCalls = new AtomicInteger(0);
 
         Statement mainStmt  = stubStatement(mainLog,  null, null);
         Statement resetStmt = stubStatement(resetLog, null, null);
-        Connection conn = stubConnection(abortCalled, closeCalled, mainStmt, resetStmt);
+        Connection conn = stubConnection(abortCalled, closeCalls, mainStmt,
+            stubBlockStatement(blocksLog, false, 0),
+            stubBlockStatement(blocksLog, false, 0), resetStmt);
 
         QueryTelemetryService.TelemetryResult result =
             buildSvc(stubDataSource(conn)).executeAndTrack("SELECT 1");
@@ -145,12 +191,13 @@ class QueryTelemetryServiceUnitTest {
         // Reset statement block: exactly one RESET
         assertEquals(1, resetLog.size(), "Expected exactly one RESET");
         assertEquals("RESET statement_timeout", resetLog.get(0));
+        assertEquals(2, blocksLog.size(), "Expected before and after block snapshots");
 
         // abort must NOT be called on success
         assertFalse(abortCalled.get(), "abort() must not be called when RESET succeeds");
 
         // conn.close() must be called
-        assertTrue(closeCalled.get(), "conn.close() must always be called");
+        assertEquals(1, closeCalls.get(), "conn.close() must run exactly once");
 
         // exec time must have been recorded (not EXEC_TIME_MISSING)
         assertNotEquals(QueryTelemetryService.EXEC_TIME_MISSING, result.execTimeMs,
@@ -165,14 +212,17 @@ class QueryTelemetryServiceUnitTest {
     @Test
     void cancelledQuery_resetStillIssued_execTimeMissing() throws Exception {
         List<String> mainLog  = new ArrayList<>();
+        List<String> blocksLog = new ArrayList<>();
         List<String> resetLog = new ArrayList<>();
         AtomicBoolean abortCalled = new AtomicBoolean(false);
-        AtomicBoolean closeCalled = new AtomicBoolean(false);
+        AtomicInteger closeCalls = new AtomicInteger(0);
 
         // EXPLAIN ANALYZE is the string that will trigger the throw
         Statement mainStmt  = stubStatement(mainLog,  "EXPLAIN ANALYZE", "57014");
         Statement resetStmt = stubStatement(resetLog, null, null);
-        Connection conn = stubConnection(abortCalled, closeCalled, mainStmt, resetStmt);
+        Connection conn = stubConnection(abortCalled, closeCalls, mainStmt,
+            stubBlockStatement(blocksLog, false, 0),
+            stubBlockStatement(blocksLog, false, 0), resetStmt);
 
         QueryTelemetryService.TelemetryResult result =
             buildSvc(stubDataSource(conn)).executeAndTrack("SELECT pg_sleep(30)");
@@ -183,7 +233,7 @@ class QueryTelemetryServiceUnitTest {
         assertEquals("RESET statement_timeout", resetLog.get(0));
 
         assertFalse(abortCalled.get(), "abort() must not be called when RESET succeeds");
-        assertTrue(closeCalled.get());
+        assertEquals(1, closeCalls.get());
         assertEquals(QueryTelemetryService.EXEC_TIME_MISSING, result.execTimeMs,
             "Cancelled query must report EXEC_TIME_MISSING");
     }
@@ -195,21 +245,24 @@ class QueryTelemetryServiceUnitTest {
     @Test
     void resetFails_abortCalled_closeStillCalled() throws Exception {
         List<String> mainLog  = new ArrayList<>();
+        List<String> blocksLog = new ArrayList<>();
         List<String> resetLog = new ArrayList<>();
         AtomicBoolean abortCalled = new AtomicBoolean(false);
-        AtomicBoolean closeCalled = new AtomicBoolean(false);
+        AtomicInteger closeCalls = new AtomicInteger(0);
 
         Statement mainStmt  = stubStatement(mainLog,  null,    null);
         Statement resetStmt = stubStatement(resetLog, "RESET", "08006"); // connection_failure
 
-        Connection conn = stubConnection(abortCalled, closeCalled, mainStmt, resetStmt);
+        Connection conn = stubConnection(abortCalled, closeCalls, mainStmt,
+            stubBlockStatement(blocksLog, false, 0),
+            stubBlockStatement(blocksLog, false, 0), resetStmt);
 
         // executeAndTrack must not throw even though RESET failed
         assertDoesNotThrow(() -> buildSvc(stubDataSource(conn)).executeAndTrack("SELECT 1"));
 
         assertEquals("RESET statement_timeout", resetLog.get(0));
         assertTrue(abortCalled.get(), "abort() must be called when RESET fails");
-        assertTrue(closeCalled.get(), "close() must be called even after abort()");
+        assertEquals(1, closeCalls.get(), "close() must run exactly once after abort()");
     }
 
     /**
@@ -219,19 +272,111 @@ class QueryTelemetryServiceUnitTest {
     @Test
     void timeoutThenResetFails_abortCalled_execTimeMissing() throws Exception {
         List<String> mainLog  = new ArrayList<>();
+        List<String> blocksLog = new ArrayList<>();
         List<String> resetLog = new ArrayList<>();
         AtomicBoolean abortCalled = new AtomicBoolean(false);
-        AtomicBoolean closeCalled = new AtomicBoolean(false);
+        AtomicInteger closeCalls = new AtomicInteger(0);
 
         Statement mainStmt  = stubStatement(mainLog,  "EXPLAIN ANALYZE", "57014");
         Statement resetStmt = stubStatement(resetLog, "RESET",           "08006");
-        Connection conn = stubConnection(abortCalled, closeCalled, mainStmt, resetStmt);
+        Connection conn = stubConnection(abortCalled, closeCalls, mainStmt,
+            stubBlockStatement(blocksLog, false, 0),
+            stubBlockStatement(blocksLog, false, 0), resetStmt);
 
         QueryTelemetryService.TelemetryResult result =
             buildSvc(stubDataSource(conn)).executeAndTrack("SELECT pg_sleep(30)");
 
         assertTrue(abortCalled.get());
-        assertTrue(closeCalled.get());
+        assertEquals(1, closeCalls.get());
         assertEquals(QueryTelemetryService.EXEC_TIME_MISSING, result.execTimeMs);
+    }
+
+    @Test
+    void executeAndTrack_borrowsOneConnection() throws Exception {
+        List<String> mainLog = new ArrayList<>();
+        List<String> blocksLog = new ArrayList<>();
+        List<String> resetLog = new ArrayList<>();
+        AtomicBoolean abortCalled = new AtomicBoolean(false);
+        AtomicInteger closeCalls = new AtomicInteger(0);
+        AtomicInteger getConnectionCalls = new AtomicInteger(0);
+
+        Connection conn = stubConnection(abortCalled, closeCalls,
+            stubStatement(mainLog, null, null),
+            stubBlockStatement(blocksLog, false, 0),
+            stubBlockStatement(blocksLog, false, 0),
+            stubStatement(resetLog, null, null));
+
+        buildSvc(stubDataSource(conn, getConnectionCalls)).executeAndTrack("SELECT 1");
+
+        assertEquals(1, getConnectionCalls.get(),
+            "executeAndTrack must borrow exactly one connection");
+    }
+
+    @Test
+    void beforeSnapshotDelay_isNotIncludedInExecTime() throws Exception {
+        List<String> mainLog = new ArrayList<>();
+        List<String> blocksLog = new ArrayList<>();
+        List<String> resetLog = new ArrayList<>();
+        AtomicBoolean abortCalled = new AtomicBoolean(false);
+        AtomicInteger closeCalls = new AtomicInteger(0);
+
+        Connection conn = stubConnection(abortCalled, closeCalls,
+            stubStatement(mainLog, null, null),
+            stubBlockStatement(blocksLog, false, 220),
+            stubBlockStatement(blocksLog, false, 0),
+            stubStatement(resetLog, null, null));
+
+        QueryTelemetryService.TelemetryResult result =
+            buildSvc(stubDataSource(conn)).executeAndTrack("SELECT 1");
+
+        assertTrue(result.blksBeforeQueryMs >= 200.0,
+            "The before snapshot stub must contribute its deliberate delay");
+        assertTrue(result.execTimeMs < 100,
+            "execTimeMs must exclude the delayed before snapshot, got: " + result.execTimeMs);
+    }
+
+    @Test
+    void beforeSnapshotFails_execTimeRecorded_zeroCounter_resetIssued() throws Exception {
+        List<String> mainLog = new ArrayList<>();
+        List<String> blocksLog = new ArrayList<>();
+        List<String> resetLog = new ArrayList<>();
+        AtomicBoolean abortCalled = new AtomicBoolean(false);
+        AtomicInteger closeCalls = new AtomicInteger(0);
+
+        Connection conn = stubConnection(abortCalled, closeCalls,
+            stubStatement(mainLog, null, null),
+            stubBlockStatement(blocksLog, true, 0),
+            stubBlockStatement(blocksLog, false, 0),
+            stubStatement(resetLog, null, null));
+
+        QueryTelemetryService.TelemetryResult result =
+            buildSvc(stubDataSource(conn)).executeAndTrack("SELECT 1");
+
+        assertNotEquals(QueryTelemetryService.EXEC_TIME_MISSING, result.execTimeMs);
+        assertEquals(0L, result.blksReadBefore);
+        assertEquals("RESET statement_timeout", resetLog.get(0));
+        assertEquals(1, closeCalls.get());
+    }
+
+    @Test
+    void afterSnapshotFails_resetAndCloseStillRun() throws Exception {
+        List<String> mainLog = new ArrayList<>();
+        List<String> blocksLog = new ArrayList<>();
+        List<String> resetLog = new ArrayList<>();
+        AtomicBoolean abortCalled = new AtomicBoolean(false);
+        AtomicInteger closeCalls = new AtomicInteger(0);
+
+        Connection conn = stubConnection(abortCalled, closeCalls,
+            stubStatement(mainLog, null, null),
+            stubBlockStatement(blocksLog, false, 0),
+            stubBlockStatement(blocksLog, true, 0),
+            stubStatement(resetLog, null, null));
+
+        QueryTelemetryService.TelemetryResult result =
+            assertDoesNotThrow(() -> buildSvc(stubDataSource(conn)).executeAndTrack("SELECT 1"));
+
+        assertEquals(0L, result.blksReadAfter);
+        assertEquals("RESET statement_timeout", resetLog.get(0));
+        assertEquals(1, closeCalls.get());
     }
 }

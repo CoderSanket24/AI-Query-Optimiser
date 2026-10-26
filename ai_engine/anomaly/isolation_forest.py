@@ -145,8 +145,7 @@ class AnomalyDetector:
         x     = np.array([[wait_time_ms, float(active_connections)]],
                          dtype=np.float32)
         score = float(forest.decision_function(x)[0])
-        label = int(forest.predict(x)[0])
-        return (label == -1), round(score, 4)
+        return (score < 0), round(score, 4)
 
     # ------------------------------------------------------------------
     def save(self) -> None:

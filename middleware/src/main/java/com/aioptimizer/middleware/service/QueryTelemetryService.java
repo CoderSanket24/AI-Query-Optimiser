@@ -18,11 +18,8 @@ import java.sql.Statement;
  *
  *   exec_time_ms  -- time PostgreSQL spends actually running the query.
  *                    Uses System.nanoTime() so fast queries do NOT round to 0.
- *                    -1 = EXEC_TIME_MISSING sentinel.
- *                    NOTE: exec_time_ms starts before SET statement_timeout and
- *                    blks_before_query, so exec_time_ms > explain_call_ms.
- *                    The gap (exec_time_ms - explain_call_ms) ≈ SET + blks_before
- *                    overhead — reported in latency_breakdown_ms as exec_time_ms_gap.
+ *                    -1 = EXEC_TIME_MISSING sentinel. Starts immediately before
+ *                    EXPLAIN ANALYZE; explain_call_ms is a cross-check.
  *
  *   latency_ms    -- total wall-clock time (wait + exec), kept for compatibility.
  *
@@ -83,9 +80,6 @@ public class QueryTelemetryService {
         Connection conn = dataSource.getConnection();
         long waitTimeMs = (System.nanoTime() - waitStart) / 1_000_000L;
 
-        // execStart is captured BEFORE SET so exec_time_ms includes set + blks_before.
-        // The gap (exec_time_ms - explain_call_ms) reveals that overhead.
-        long execStart      = System.nanoTime();
         long execTimeMs     = EXEC_TIME_MISSING;
         long blksReadBefore = 0L;
         long blksReadAfter  = 0L;
@@ -112,7 +106,7 @@ public class QueryTelemetryService {
 
                 // Snapshot I/O counters before the query runs.
                 long _bb0 = System.nanoTime();
-                blksReadBefore = queryBlksRead();
+                blksReadBefore = queryBlksRead(conn);
                 blksBeforeQueryMs = (System.nanoTime() - _bb0) / 1e6;
                 if (blksBeforeQueryMs > 100.0) {
                     System.out.printf(
@@ -125,6 +119,7 @@ public class QueryTelemetryService {
                 // execTimeMs stays EXEC_TIME_MISSING on cancellation.
                 long _explainStart = System.nanoTime();
                 try {
+                    long execStart = System.nanoTime();
                     stmt.execute("EXPLAIN ANALYZE " + finalSql);
                     execTimeMs = (System.nanoTime() - execStart) / 1_000_000L;
                 } catch (Exception queryEx) {
@@ -146,7 +141,7 @@ public class QueryTelemetryService {
             } finally {
                 // Snapshot I/O counters after the query finishes (or is cancelled).
                 long _ba0 = System.nanoTime();
-                blksReadAfter = queryBlksRead();
+                blksReadAfter = queryBlksRead(conn);
                 blksAfterQueryMs = (System.nanoTime() - _ba0) / 1e6;
                 if (blksAfterQueryMs > 100.0) {
                     System.out.printf(
@@ -197,12 +192,13 @@ public class QueryTelemetryService {
      * Reads the cumulative blks_read counter for this database from pg_stat_database.
      * Returns 0 on any error so a stat failure never interrupts query execution.
      */
-    private long queryBlksRead() {
-        try {
+    private long queryBlksRead(Connection conn) {
+        try (Statement stmt = conn.createStatement()) {
             String statSql =
                 "SELECT blks_read FROM pg_stat_database WHERE datname = current_database()";
-            Long val = jdbcTemplate.queryForObject(statSql, Long.class);
-            return (val != null) ? val : 0L;
+            try (java.sql.ResultSet rs = stmt.executeQuery(statSql)) {
+                return rs.next() ? rs.getLong(1) : 0L;
+            }
         } catch (Exception e) {
             return 0L;
         }
@@ -264,8 +260,7 @@ public class QueryTelemetryService {
         public double setTimeoutMs;
         /**
          * Wall-clock time of the EXPLAIN ANALYZE call only — recorded even when the
-         * query is cancelled.  The gap (execTimeMs - explainCallMs) reveals the
-         * overhead of SET + blks_before that is included in execTimeMs's start point.
+         * query is cancelled.  It serves as a cross-check for execTimeMs.
          */
         public double explainCallMs;
         /** Time to query pg_stat_database.blks_read before EXPLAIN ANALYZE. */
