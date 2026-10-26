@@ -5,9 +5,12 @@ import time
 URL     = "http://localhost:8080/api/query/execute"
 HEADERS = {"Content-Type": "application/json"}
 
-# Must be comfortably above QueryTelemetryService.STATEMENT_TIMEOUT_MS (10 s)
-# plus Spring/network round-trip overhead.
-HTTP_TIMEOUT_SEC = 30
+# HTTP_TIMEOUT_SEC must cover the full round-trip:
+#   QueryTelemetryService.STATEMENT_TIMEOUT_MS  (DB cancels the query)
+# + /optimize call time (PPO inference, hint generation)
+# + /feedback call time (reward computation, possibly PPO batch training)
+# + network and Spring overhead
+HTTP_TIMEOUT_SEC = 90
 
 QUERIES = [
     "SELECT t.title FROM title t JOIN cast_info ci ON t.id=ci.movie_id WHERE t.production_year=1980 LIMIT 10",
@@ -85,7 +88,7 @@ def run():
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
                 res       = json.loads(resp.read())
                 exec_time = res.get("exec_time_ms", -1)
-                order     = " -> ".join(res.get("choosen_order", []))
+                order     = " -> ".join(res.get("chosen_order", []))
                 hinted    = res.get("hint_applied", "?")
                 safe      = res.get("aliases_safe", "?")
                 print(f"         Order  : {order}")

@@ -45,6 +45,7 @@ Thresholds:
 """
 
 import os
+import threading
 import numpy as np
 import joblib
 from sklearn.ensemble import IsolationForest as SKLearnIF
@@ -79,22 +80,33 @@ class AnomalyDetector:
         self._forest           = None
         self.is_fitted         = False
         self.n_samples_trained = 0
+        # Guards the (forest, is_fitted, n_samples_trained) triple so predict()
+        # can read a consistent snapshot while the worker swaps a new forest in.
+        self._lock             = threading.Lock()
 
     # ------------------------------------------------------------------
     def fit(self, samples: list) -> None:
         """
         Train on list of [wait_time_ms, active_connections] vectors.
         Automatically saves to disk after fitting.
+
+        The new forest is built in a LOCAL variable OUTSIDE the lock so the
+        (potentially slow) sklearn fit never blocks predict(); only the final
+        reference + counter swap is done under the brief lock.
         """
         X = np.array(samples, dtype=np.float32)
-        self._forest = SKLearnIF(
+        new_forest = SKLearnIF(
             n_estimators  = self.n_estimators,
             contamination = self.contamination,
             random_state  = 42,
         )
-        self._forest.fit(X)
-        self.is_fitted         = True
-        self.n_samples_trained = len(samples)
+        new_forest.fit(X)
+
+        with self._lock:
+            self._forest           = new_forest
+            self.is_fitted         = True
+            self.n_samples_trained = len(samples)
+
         print(
             f"[Forest] Fitted on {self.n_samples_trained} samples "
             f"| contamination={self.contamination} "
@@ -122,13 +134,18 @@ class AnomalyDetector:
         If not yet fitted -> returns (False, 0.0) so PPO trains normally
         until we have enough samples for a reliable boundary.
         """
-        if not self.is_fitted:
+        # Read the forest reference ONCE under the lock, then use the local
+        # variable — the worker may swap self._forest concurrently in fit().
+        with self._lock:
+            forest = self._forest
+
+        if forest is None:
             return False, 0.0
 
         x     = np.array([[wait_time_ms, float(active_connections)]],
                          dtype=np.float32)
-        score = float(self._forest.decision_function(x)[0])
-        label = int(self._forest.predict(x)[0])
+        score = float(forest.decision_function(x)[0])
+        label = int(forest.predict(x)[0])
         return (label == -1), round(score, 4)
 
     # ------------------------------------------------------------------

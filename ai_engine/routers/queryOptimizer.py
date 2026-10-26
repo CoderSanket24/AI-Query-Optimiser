@@ -25,6 +25,7 @@ Per-stage latency instrumentation
 server_timings_ms keys (all fractional ms via time.perf_counter()):
   vectorize       -- build_state_tensor() (schema stats fetch + tensor build)
   sample          -- trainer.sample_action() (PPO forward + categorical sample)
+  sample_lock_wait-- time sample_action spent waiting for the trainer RLock
   attention       -- ai_model forward pass for XAI weights (torch.no_grad())
   hint_build      -- _nested_leading() + final SQL assembly
   optimize_total  -- entire endpoint wall-clock (superset of the above)
@@ -95,11 +96,15 @@ async def optimize_query(state: QueryState):
         state_tensor, aliases, join_conditions)
     sample_ms = (time.perf_counter() - _t0) * 1000.0
 
-    # 3. XAI explanation (no gradient needed)
+    # 3. XAI explanation (no gradient needed).
+    #    Serialise against the training worker so this forward pass never
+    #    reads model weights mid-update (same RLock that sample_action /
+    #    train_step / train_batch hold).
     import torch
     _t0 = time.perf_counter()
-    with torch.no_grad():
-        _, attention_weights = ai_model(state_tensor)
+    with trainer.lock:
+        with torch.no_grad():
+            _, attention_weights = ai_model(state_tensor)
     attention_ms = (time.perf_counter() - _t0) * 1000.0
     xai_explanation = {
         alias: round(attention_weights[i].item() * 100, 2)
@@ -155,6 +160,7 @@ async def optimize_query(state: QueryState):
         "server_timings_ms": {
             "vectorize":      round(vectorize_ms,      3),
             "sample":         round(sample_ms,         3),
+            "sample_lock_wait": round(trainer.last_lock_wait_ms, 3),
             "attention":      round(attention_ms,      3),
             "hint_build":     round(hint_build_ms,     3),
             "optimize_total": round(optimize_total_ms, 3),

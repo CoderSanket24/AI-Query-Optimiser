@@ -1,4 +1,6 @@
 import os
+import time
+import threading
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -119,6 +121,11 @@ class PPOTrainer:
         self.baseline    = 0.0
         self.train_count = 0
         self.total_loss  = 0.0
+        # Single re-entrant lock serialising model READS (sample_action,
+        # the /optimize attention forward pass) against model WRITES
+        # (train_step / train_batch on the feedback worker thread).
+        self.lock              = threading.RLock()
+        self.last_lock_wait_ms = 0.0
 
     # ── Stochastic graph-aware sampling ────────────────────────────────────────
 
@@ -136,9 +143,18 @@ class PPOTrainer:
         """
         adj = _parse_join_graph(aliases, join_conditions or [])
 
-        with torch.no_grad():
-            _, probs = self.model(state_tensor)   # [N]
-            probs    = probs.clone()
+        # Serialise against the training worker so the forward pass never
+        # reads model weights mid-update (which would corrupt log_prob_old).
+        # Time the lock wait so /optimize can report it.
+        _lock_t0 = time.perf_counter()
+        self.lock.acquire()
+        self.last_lock_wait_ms = (time.perf_counter() - _lock_t0) * 1000.0
+        try:
+            with torch.no_grad():
+                _, probs = self.model(state_tensor)   # [N]
+                probs    = probs.clone()
+        finally:
+            self.lock.release()
 
         alias_to_global = {a: i for i, a in enumerate(aliases)}
         remaining       = list(aliases)
@@ -216,30 +232,32 @@ class PPOTrainer:
 
         state_tensor = build_state_tensor(stat_names)
 
-        self.baseline = ((1.0 - self.BASELINE_ALPHA) * self.baseline
-                         + self.BASELINE_ALPHA * reward)
-        advantage = reward - self.baseline
+        # Serialise against /optimize sampling on the request thread.
+        with self.lock:
+            self.baseline = ((1.0 - self.BASELINE_ALPHA) * self.baseline
+                             + self.BASELINE_ALPHA * reward)
+            advantage = reward - self.baseline
 
-        log_prob = self.sequence_log_prob(state_tensor, aliases, chosen_order,
-                                          join_conditions)
-        loss = -log_prob * advantage
+            log_prob = self.sequence_log_prob(state_tensor, aliases, chosen_order,
+                                              join_conditions)
+            loss = -log_prob * advantage
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.GRAD_CLIP)
-        self.optimizer.step()
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.GRAD_CLIP)
+            self.optimizer.step()
 
-        self.train_count += 1
-        self.total_loss  += loss.item()
+            self.train_count += 1
+            self.total_loss  += loss.item()
 
-        metrics = {
-            "mode":       "reinforce",
-            "train_step": self.train_count,
-            "loss":       round(loss.item(), 6),
-            "advantage":  round(float(advantage), 4),
-            "baseline":   round(self.baseline, 4),
-            "reward":     round(reward, 4),
-        }
+            metrics = {
+                "mode":       "reinforce",
+                "train_step": self.train_count,
+                "loss":       round(loss.item(), 6),
+                "advantage":  round(float(advantage), 4),
+                "baseline":   round(self.baseline, 4),
+                "reward":     round(reward, 4),
+            }
         print(
             f"[PPO/REINFORCE] step={self.train_count}  "
             f"loss={metrics['loss']:.4f}  adv={metrics['advantage']:.1f}  "
@@ -264,74 +282,76 @@ class PPOTrainer:
         if not experiences:
             return {}
 
-        total_loss  = 0.0
-        total_steps = 0
-        total_clip  = 0
+        # Serialise against /optimize sampling on the request thread.
+        with self.lock:
+            total_loss  = 0.0
+            total_steps = 0
+            total_clip  = 0
 
-        for epoch in range(self.PPO_EPOCHS):
-            epoch_loss = 0.0
-            for exp in experiences:
-                state_tensor    = exp["state_tensor"]
-                aliases         = exp["aliases"]
-                chosen_order    = exp["chosen_order"]
-                join_conditions = exp.get("join_conditions", [])
-                log_prob_old    = exp["log_prob_old"]
-                reward          = exp["reward"]
+            for epoch in range(self.PPO_EPOCHS):
+                epoch_loss = 0.0
+                for exp in experiences:
+                    state_tensor    = exp["state_tensor"]
+                    aliases         = exp["aliases"]
+                    chosen_order    = exp["chosen_order"]
+                    join_conditions = exp.get("join_conditions", [])
+                    log_prob_old    = exp["log_prob_old"]
+                    reward          = exp["reward"]
 
-                self.baseline = ((1.0 - self.BASELINE_ALPHA) * self.baseline
-                                 + self.BASELINE_ALPHA * reward)
-                advantage = reward - self.baseline
+                    self.baseline = ((1.0 - self.BASELINE_ALPHA) * self.baseline
+                                     + self.BASELINE_ALPHA * reward)
+                    advantage = reward - self.baseline
 
-                log_prob_new = self.sequence_log_prob(
-                    state_tensor, aliases, chosen_order, join_conditions)
+                    log_prob_new = self.sequence_log_prob(
+                        state_tensor, aliases, chosen_order, join_conditions)
 
-                ratio = torch.exp(
-                    log_prob_new - torch.tensor(log_prob_old, dtype=torch.float32))
+                    ratio = torch.exp(
+                        log_prob_new - torch.tensor(log_prob_old, dtype=torch.float32))
 
-                surr1 = ratio * advantage
-                surr2 = torch.clamp(ratio,
-                                    1.0 - self.CLIP_EPS,
-                                    1.0 + self.CLIP_EPS) * advantage
-                loss  = -torch.min(surr1, surr2)
+                    surr1 = ratio * advantage
+                    surr2 = torch.clamp(ratio,
+                                        1.0 - self.CLIP_EPS,
+                                        1.0 + self.CLIP_EPS) * advantage
+                    loss  = -torch.min(surr1, surr2)
 
-                if (ratio.item() < 1.0 - self.CLIP_EPS or
-                        ratio.item() > 1.0 + self.CLIP_EPS):
-                    total_clip += 1
+                    if (ratio.item() < 1.0 - self.CLIP_EPS or
+                            ratio.item() > 1.0 + self.CLIP_EPS):
+                        total_clip += 1
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.GRAD_CLIP)
-                self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.GRAD_CLIP)
+                    self.optimizer.step()
 
-                epoch_loss   += loss.item()
-                total_loss   += loss.item()
-                total_steps  += 1
-                self.train_count += 1
-                self.total_loss  += loss.item()
+                    epoch_loss   += loss.item()
+                    total_loss   += loss.item()
+                    total_steps  += 1
+                    self.train_count += 1
+                    self.total_loss  += loss.item()
 
-            avg_epoch = epoch_loss / len(experiences)
-            print(
-                f"[PPO/Clip] epoch={epoch+1}/{self.PPO_EPOCHS}  "
-                f"avg_loss={avg_epoch:.4f}  "
-                f"baseline={self.baseline:.1f}  "
-                f"clip_events={total_clip}"
-            )
+                avg_epoch = epoch_loss / len(experiences)
+                print(
+                    f"[PPO/Clip] epoch={epoch+1}/{self.PPO_EPOCHS}  "
+                    f"avg_loss={avg_epoch:.4f}  "
+                    f"baseline={self.baseline:.1f}  "
+                    f"clip_events={total_clip}"
+                )
 
-        avg_loss   = total_loss / max(total_steps, 1)
-        avg_reward = sum(e["reward"] for e in experiences) / len(experiences)
-        clip_rate  = round(total_clip / max(total_steps, 1) * 100, 1)
+            avg_loss   = total_loss / max(total_steps, 1)
+            avg_reward = sum(e["reward"] for e in experiences) / len(experiences)
+            clip_rate  = round(total_clip / max(total_steps, 1) * 100, 1)
 
-        metrics = {
-            "mode":          "ppo_clip",
-            "train_step":    self.train_count,
-            "batch_size":    len(experiences),
-            "ppo_epochs":    self.PPO_EPOCHS,
-            "clip_eps":      self.CLIP_EPS,
-            "avg_loss":      round(avg_loss, 6),
-            "clip_rate_pct": clip_rate,
-            "avg_reward":    round(avg_reward, 4),
-            "baseline":      round(self.baseline, 4),
-        }
+            metrics = {
+                "mode":          "ppo_clip",
+                "train_step":    self.train_count,
+                "batch_size":    len(experiences),
+                "ppo_epochs":    self.PPO_EPOCHS,
+                "clip_eps":      self.CLIP_EPS,
+                "avg_loss":      round(avg_loss, 6),
+                "clip_rate_pct": clip_rate,
+                "avg_reward":    round(avg_reward, 4),
+                "baseline":      round(self.baseline, 4),
+            }
         print(
             f"[PPO/Clip] BATCH DONE  batch={len(experiences)}  "
             f"avg_loss={avg_loss:.4f}  clip_rate={clip_rate}%  "

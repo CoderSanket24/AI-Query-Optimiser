@@ -30,6 +30,15 @@ POST /feedback
   Step 2 — Forest refit (every MIN_SAMPLES / RETRAIN_EVERY_N NORMAL samples).
   Step 3 — Checkpoint save (after every PPO batch update).
 
+  OFFLOAD (Part 2b-1):
+    Training (train_batch/train_step), checkpoint save, and forest refit are
+    moved OFF the HTTP request path onto a single daemon worker thread that
+    drains a bounded queue (QUEUE_MAX).  The request thread only computes the
+    reward, accumulates the batch, and enqueues the work; a full queue DROPS
+    the item (counted, never blocks).  Because the worker is a daemon, any
+    items still queued at process exit are LOST (that train/refit/checkpoint
+    never runs).
+
   PPO path (Bug 3 fix):
     log_prob_old is read from the server-side pending store (pop_pending),
     NOT from the HTTP payload.  The client never sees or sends log_prob_old,
@@ -40,21 +49,25 @@ Per-stage latency instrumentation
 ----------------------------------
 server_timings_ms keys (all fractional ms via time.perf_counter()):
   anomaly_predict  -- detector.predict() call
-  training         -- trainer.train_batch() or trainer.train_step() call only
-                      (0.0 when training is skipped or batch is still accumulating)
-  checkpoint_save  -- trainer.save_checkpoint() call only (separate from training)
-                      (0.0 when checkpoint is not saved this request)
+  training         -- always 0.0 now (training is offloaded to the worker)
+  checkpoint_save  -- always 0.0 now (checkpoint save is offloaded to the worker)
   analytics        -- complete_record() call
-  forest_refit     -- detector.fit() call only (0.0 when refit threshold not reached)
+  forest_refit     -- always 0.0 now (refit is offloaded to the worker)
   feedback_total   -- entire endpoint wall-clock (superset of the above)
 
-GET /feedback/stats   -- PPO + buffer + checkpoint state
+  The worker logs its own wall-clock as fb_worker_train_ms (train + checkpoint).
+  Because analytics is completed at request time, analytics records show the
+  PRE-TRAINING train_count / loss / baseline (they lag one training event).
+
+GET /feedback/stats   -- PPO + buffer + checkpoint + worker queue/drop/error state
 GET /feedback/buffer  -- raw replay buffer (debug)
 """
 
 import os
 import time
+import queue
 import threading
+import traceback
 from collections import deque
 from fastapi import APIRouter
 from models.feedback_model import FeedbackPayload
@@ -85,6 +98,86 @@ _forest_samples: list = []
 _forest_lock          = threading.Lock()
 
 
+# ── Background training / checkpoint / forest-refit worker ──────────
+# All model and forest WRITES are moved off the request path onto a single
+# daemon worker thread that drains a bounded queue.  When the queue is full
+# the request DROPS the item (and counts it) instead of ever blocking.
+#
+# NOTE: a daemon thread does not drain on shutdown, so any items still queued
+# when the process exits are LOST (that training/refit/checkpoint never runs).
+QUEUE_MAX = 256
+
+_worker_queue         = queue.Queue(maxsize=QUEUE_MAX)
+_stats_lock           = threading.Lock()
+_dropped_count        = 0
+_worker_error_count   = 0
+_last_worker_error    = ""
+_last_worker_train_ms = 0.0
+
+
+def _process_item(kind: str, payload) -> float:
+    """Run one queued work item. Returns elapsed ms. Raises on error."""
+    _t0 = time.perf_counter()
+    if kind == "ppo_train":
+        trainer.train_batch(payload)
+        trainer.save_checkpoint()
+    elif kind == "reinforce":
+        trainer.train_step(payload)
+        trainer.save_checkpoint()
+    elif kind == "forest_refit":
+        detector.fit(payload)
+    elif kind == "checkpoint":
+        trainer.save_checkpoint()
+    else:
+        raise ValueError(f"unknown worker item kind: {kind}")
+    return (time.perf_counter() - _t0) * 1000.0
+
+
+def _worker_loop(q: queue.Queue) -> None:
+    """Drain `q` forever. Exceptions are logged and never kill the worker."""
+    global _worker_error_count, _last_worker_error, _last_worker_train_ms
+    while True:
+        item = q.get()
+        kind = item[0]
+        try:
+            elapsed_ms = _process_item(kind, item[1])
+            if kind in ("ppo_train", "reinforce", "checkpoint"):
+                with _stats_lock:
+                    _last_worker_train_ms = elapsed_ms
+                print(f"[Worker] {kind} done  fb_worker_train_ms={elapsed_ms:.3f}")
+            else:
+                print(f"[Worker] {kind} done in {elapsed_ms:.3f} ms")
+        except Exception as exc:
+            with _stats_lock:
+                _worker_error_count += 1
+                _last_worker_error = f"{type(exc).__name__}: {exc}"
+            print(f"[Worker] ERROR in {kind}: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+        finally:
+            q.task_done()
+
+
+# The queue object is captured by the thread's target so that swapping the
+# module-global `_worker_queue` (done by tests) never disrupts the worker.
+_worker_thread = threading.Thread(
+    target=_worker_loop, args=(_worker_queue,),
+    name="feedback-worker", daemon=True)
+_worker_thread.start()
+
+
+def _enqueue(item) -> bool:
+    """Non-blocking enqueue. Returns True if queued, False if dropped (full)."""
+    global _dropped_count
+    try:
+        _worker_queue.put_nowait(item)
+        return True
+    except queue.Full:
+        with _stats_lock:
+            _dropped_count += 1
+        print("[Worker] queue full — dropped one item (counted)")
+        return False
+
+
 @router.post("/feedback")
 async def receive_feedback(payload: FeedbackPayload):
     _fb_start = time.perf_counter()
@@ -107,7 +200,8 @@ async def receive_feedback(payload: FeedbackPayload):
     )
     anomaly_predict_ms = (time.perf_counter() - _t0) * 1000.0
 
-    # Timer accumulators — set to 0.0 and overwritten only when the code path fires.
+    # Timer accumulators. training / checkpoint_save / forest_refit stay 0.0:
+    # those stages are offloaded to the worker (logged there as fb_worker_train_ms).
     training_ms       = 0.0
     checkpoint_save_ms = 0.0
     analytics_ms      = 0.0
@@ -208,7 +302,12 @@ async def receive_feedback(payload: FeedbackPayload):
         with _buffer_lock:
             n = len(_replay_buffer)
 
-    # ── Step 3: PPO training ─────────────────────────────────────────
+    # ── Step 3: PPO training (OFFLOADED to the worker) ───────────────
+    # Training + checkpoint writes no longer run on the request thread: we
+    # compute the reward, accumulate the batch, then ENQUEUE the work.
+    # The worker thread performs train_batch/train_step + save_checkpoint.
+    # training_ms / checkpoint_save_ms therefore stay 0.0 here — the worker
+    # logs its own wall-clock as fb_worker_train_ms.
     train_metrics   = {}
     ppo_batch_fired = False
 
@@ -238,14 +337,12 @@ async def receive_feedback(payload: FeedbackPayload):
                     _ppo_batch.clear()
 
             if batch_ready:
-                _t0 = time.perf_counter()
-                train_metrics = trainer.train_batch(batch_to_train)
-                training_ms = (time.perf_counter() - _t0) * 1000.0
+                queued = _enqueue(("ppo_train", batch_to_train))
                 ppo_batch_fired = True
-
-                _t0 = time.perf_counter()
-                trainer.save_checkpoint()
-                checkpoint_save_ms = (time.perf_counter() - _t0) * 1000.0
+                train_metrics = {
+                    "mode":       "queued" if queued else "queued_full_dropped",
+                    "batch_size": len(batch_to_train),
+                }
             else:
                 with _ppo_batch_lock:
                     queued = len(_ppo_batch)
@@ -256,23 +353,17 @@ async def receive_feedback(payload: FeedbackPayload):
                 }
         else:
             # Pending entry expired or was never created → REINFORCE fallback
-            _t0 = time.perf_counter()
-            train_metrics = trainer.train_step(experience)
-            training_ms = (time.perf_counter() - _t0) * 1000.0
-
-            _t0 = time.perf_counter()
-            trainer.save_checkpoint()
-            checkpoint_save_ms = (time.perf_counter() - _t0) * 1000.0
+            queued = _enqueue(("reinforce", experience))
+            train_metrics = {"mode": "queued_reinforce" if queued else "queued_full_dropped"}
     else:
-        _t0 = time.perf_counter()
-        train_metrics = trainer.train_step(experience)
-        training_ms = (time.perf_counter() - _t0) * 1000.0
-
-        _t0 = time.perf_counter()
-        trainer.save_checkpoint()
-        checkpoint_save_ms = (time.perf_counter() - _t0) * 1000.0
+        queued = _enqueue(("reinforce", experience))
+        train_metrics = {"mode": "queued_reinforce" if queued else "queued_full_dropped"}
 
     # ── Step 4: Analytics ────────────────────────────────────────────
+    # Completed at REQUEST time, so ppo_step/ppo_loss/ppo_baseline reflect
+    # the trainer state BEFORE this request's training (the actual training
+    # metrics are not known yet — the worker logs them separately as
+    # fb_worker_train_ms). Analytics therefore lags one training event.
     if payload.query_id is not None:
         _t0 = time.perf_counter()
         complete_record(
@@ -289,9 +380,8 @@ async def receive_feedback(payload: FeedbackPayload):
         analytics_ms = (time.perf_counter() - _t0) * 1000.0
 
     # ── Step 5: Forest refit (normal samples only) ───────────────────
-    # _accumulate_forest_sample returns (retrained: bool, refit_ms: float).
-    # detector.fit() is timed inside the helper; forest_refit_ms = 0.0 when
-    # the refit threshold has not been reached.
+    # The refit threshold is still checked here, but detector.fit() is
+    # ENQUEUED to the worker; forest_refit_ms stays 0.0 at request time.
     forest_retrained, forest_refit_ms = _accumulate_forest_sample(
         wait_ms, payload.active_connections)
 
@@ -328,9 +418,9 @@ def _accumulate_forest_sample(wait_ms: float,
     exec_time can be high due to PPO's own suboptimal join order.
     Triggers refit when MIN_SAMPLES_TO_FIT reached, then every RETRAIN_EVERY_N.
 
-    Returns (retrained: bool, forest_refit_ms: float).
-    forest_refit_ms is the wall-clock time of detector.fit() only; it is 0.0
-    when the refit threshold has not been reached this call.
+    detector.fit() is now OFFLOADED to the worker: when the threshold is
+    reached the sample snapshot is enqueued and this returns (False, 0.0)
+    because the refit no longer runs synchronously on the request path.
     """
     sample = [wait_ms, float(connections)]
     with _forest_lock:
@@ -342,10 +432,7 @@ def _accumulate_forest_sample(wait_ms: float,
                   (n > MIN_SAMPLES_TO_FIT and (n - MIN_SAMPLES_TO_FIT) % RETRAIN_EVERY_N == 0))
 
     if should_fit and n >= MIN_SAMPLES_TO_FIT:
-        _t0 = time.perf_counter()
-        detector.fit(samples)
-        refit_ms = (time.perf_counter() - _t0) * 1000.0
-        return True, refit_ms
+        _enqueue(("forest_refit", samples))
 
     return False, 0.0
 
@@ -378,6 +465,11 @@ async def training_stats():
         ppo_queued = len(_ppo_batch)
     with _forest_lock:
         forest_samples = len(_forest_samples)
+    with _stats_lock:
+        dropped       = _dropped_count
+        err_count     = _worker_error_count
+        last_err      = _last_worker_error
+        last_train_ms = _last_worker_train_ms
     ckpt = {"exists": trainer.checkpoint_exists, "path": trainer.checkpoint_path}
     if trainer.checkpoint_exists:
         ckpt["size_kb"] = round(os.stat(trainer.checkpoint_path).st_size / 1024, 2)
@@ -391,6 +483,13 @@ async def training_stats():
         "forest_samples":     forest_samples,
         "forest_min_to_fit":  MIN_SAMPLES_TO_FIT,
         "checkpoint":         ckpt,
+        # Worker / offload status
+        "worker_queue_depth":     _worker_queue.qsize(),
+        "worker_queue_max":       QUEUE_MAX,
+        "worker_dropped_count":   dropped,
+        "worker_error_count":     err_count,
+        "worker_last_error":      last_err,
+        "worker_last_train_ms":   round(last_train_ms, 3),
     }
 
 
