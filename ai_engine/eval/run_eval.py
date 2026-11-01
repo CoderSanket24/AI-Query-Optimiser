@@ -38,6 +38,32 @@ SETTINGS = {"jit": "off", "synchronize_seqscans": "off", "max_parallel_workers_p
 RESULTS = EVAL_DIR / "results"
 RAW = RESULTS / "raw.csv"
 CALIBRATION = RESULTS / "calibration.csv"
+BUFFER_COUNTER_VERSION = 2
+
+
+def parse_top_node_buffers(output):
+    """Parse the first plan-node Buffers line, keeping shared and temp counters separate."""
+    counts = {"shared_hit_blocks": 0, "shared_read_blocks": 0, "shared_dirtied_blocks": 0,
+              "shared_written_blocks": 0, "temp_read_blocks": 0, "temp_written_blocks": 0}
+    for line in output.splitlines():
+        if "Buffers:" not in line or line.lstrip().startswith(("Planning:", "JIT:", "Execution Time:")):
+            continue
+        payload = line.split("Buffers:", 1)[1]
+        sections = list(re.finditer(r"\b(shared|temp)\s+", payload))
+        for index, section in enumerate(sections):
+            scope = section.group(1)
+            end = sections[index + 1].start() if index + 1 < len(sections) else len(payload)
+            counters = payload[section.end():end]
+            for counter, value in re.findall(r"\b(hit|read|dirtied|written)=(\d+)", counters):
+                if scope == "shared":
+                    key = f"shared_{counter}_blocks"
+                elif counter in {"read", "written"}:
+                    key = f"temp_{counter}_blocks"
+                else:
+                    continue
+                counts[key] = int(value)
+        return counts
+    return counts
 
 
 def dsn():
@@ -223,19 +249,16 @@ def execution(conn, statement):
             output = "\n".join(row[0] for row in cur.fetchall())
         elapsed = (time.perf_counter() - start) * 1000
         match = re.search(r"Execution Time:\s*([0-9.]+)\s*ms", output)
-        # The first plan-node Buffers line is the root's inclusive total; using
-        # later node lines would count child buffers more than once.
-        buffer_line = next((line for line in output.splitlines() if "Buffers:" in line and "shared" in line), "")
-        hit_match = re.search(r"shared hit=(\d+)", buffer_line)
-        read_match = re.search(r"shared read=(\d+)", buffer_line)
+        buffer_counts = parse_top_node_buffers(output)
         return (float(match.group(1)) if match else elapsed, elapsed, False,
                 notices_used(conn.notices, "/*+ Leading" in statement and statement.split("*/", 1)[0] + "*/" if "/*+ Leading" in statement else None), "",
-                int(hit_match.group(1)) if hit_match else 0, int(read_match.group(1)) if read_match else 0)
+                *(buffer_counts[key] for key in ("shared_hit_blocks", "shared_read_blocks", "shared_dirtied_blocks",
+                                                   "shared_written_blocks", "temp_read_blocks", "temp_written_blocks")))
     except psycopg2.Error as exc:
         elapsed = (time.perf_counter() - start) * 1000
         timeout = getattr(exc, "pgcode", None) == "57014"
         conn.rollback()
-        return (TIMEOUT_MS if timeout else elapsed, elapsed, timeout, False, str(exc), "", "")
+        return (TIMEOUT_MS if timeout else elapsed, elapsed, timeout, False, str(exc), "", "", "", "", "", "")
 
 
 def filter_profile(conn, query, table_totals):
@@ -300,7 +323,8 @@ def select_quick_queries(queries, requested):
 
 RAW_FIELDS = ["query_id", "template_id", "split", "n_tables", "table_set", "arm", "plan_id", "plan_fingerprint",
               "order", "repeat", "phase", "exec_ms", "wall_ms", "shared_hit_blocks", "shared_read_blocks",
-              "timeout", "hint_used", "hint_reused", "reuse_source", "error"]
+              "shared_dirtied_blocks", "shared_written_blocks", "temp_read_blocks", "temp_written_blocks",
+              "buffer_parser_version", "timeout", "hint_used", "hint_reused", "reuse_source", "error"]
 
 
 def ensure_raw_schema():
@@ -370,6 +394,9 @@ def write_raw_row(writer, query, fingerprint, arm, variant, repeat, phase, value
                      "plan_id": fingerprint, "plan_fingerprint": fingerprint, "order": " ".join(variant["order"]),
                      "repeat": repeat, "phase": phase, "exec_ms": value[0], "wall_ms": value[1],
                      "shared_hit_blocks": value[5], "shared_read_blocks": value[6],
+                     "shared_dirtied_blocks": value[7], "shared_written_blocks": value[8],
+                     "temp_read_blocks": value[9], "temp_written_blocks": value[10],
+                     "buffer_parser_version": BUFFER_COUNTER_VERSION,
                      "timeout": value[2], "hint_used": variant["hint_used"], "hint_reused": hint_reused,
                      "reuse_source": reuse_source, "error": value[4]})
 
@@ -647,20 +674,18 @@ def main():
         if RAW.exists():
             with RAW.open(newline="", encoding="utf-8") as f:
                 existing_rows = list(csv.DictReader(f))
-        if args.quick:
-            quick_ids = {query["query_id"] for query in queries}
-            stale_queries = {row.get("query_id") for row in existing_rows
-                             if row.get("query_id") in quick_ids and row.get("phase") == "measured"
-                             and row.get("timeout", "").lower() != "true"
-                             and (row.get("shared_hit_blocks", "") == "" or row.get("shared_read_blocks", "") == "")}
-            if stale_queries:
-                # Old quick results predate BUFFERS; refresh those query slices so
-                # quick-mode analysis has a complete shared hit/read sample.
-                existing_rows = [row for row in existing_rows if row.get("query_id") not in stale_queries]
-                with RAW.open("w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=RAW_FIELDS)
-                    writer.writeheader(); writer.writerows(existing_rows)
-                print(f"Refreshing {len(stale_queries)} quick query result slices to record shared BUFFERS: {', '.join(sorted(stale_queries))}")
+        run_ids = {query["query_id"] for query in queries}
+        stale_queries = {row.get("query_id") for row in existing_rows
+                         if row.get("query_id") in run_ids
+                         and row.get("buffer_parser_version") != str(BUFFER_COUNTER_VERSION)}
+        if stale_queries:
+            # Rows written by an older parser cannot safely resume: its read
+            # regex missed PostgreSQL's shared hit=... read=... format.
+            existing_rows = [row for row in existing_rows if row.get("query_id") not in stale_queries]
+            with RAW.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=RAW_FIELDS)
+                writer.writeheader(); writer.writerows(existing_rows)
+            print(f"Refreshing {len(stale_queries)} query result slices with stale/missing BUFFERS parsing: {', '.join(sorted(stale_queries))}")
         physical_done = {}
         written_keys = set()
         for row in existing_rows:
@@ -680,7 +705,8 @@ def main():
         def stored_value(row):
             return (float(row.get("exec_ms") or 0), float(row.get("wall_ms") or 0),
                     row.get("timeout", "").lower() == "true", row.get("hint_used", "").lower() == "true", row.get("error", ""),
-                    row.get("shared_hit_blocks", ""), row.get("shared_read_blocks", ""))
+                    *(row.get(key, "") for key in ("shared_hit_blocks", "shared_read_blocks", "shared_dirtied_blocks",
+                                                     "shared_written_blocks", "temp_read_blocks", "temp_written_blocks")))
 
         def append_group(writer, group, repeat, phase, value, owner_arm):
             query, fp = group["query"], group["fingerprint"]
@@ -708,13 +734,15 @@ def main():
                 else:
                     warm = execution(conn, variants[owner]["statement"])
                     append_group(writer, group, "warmup", "warmup", warm, owner); f.flush()
-                    physical_done[warm_key] = {"exec_ms": warm[0], "wall_ms": warm[1], "timeout": str(warm[2]), "hint_used": str(warm[3]), "error": warm[4], "shared_hit_blocks": warm[5], "shared_read_blocks": warm[6], "hint_reused": "false"}
+                    physical_done[warm_key] = {"exec_ms": warm[0], "wall_ms": warm[1], "timeout": str(warm[2]), "hint_used": str(warm[3]), "error": warm[4],
+                                               **dict(zip(("shared_hit_blocks", "shared_read_blocks", "shared_dirtied_blocks", "shared_written_blocks", "temp_read_blocks", "temp_written_blocks"), warm[5:11])),
+                                               "buffer_parser_version": BUFFER_COUNTER_VERSION, "hint_reused": "false"}
                 group["warm"] = warm
                 group["repeat_count"] = 3 if (not warm[2] and warm[0] > 10000) else r
                 if warm[2]:
                     for repeat in range(1, group["repeat_count"] + 1):
                         key = (group["query"]["query_id"], group["fingerprint"], str(repeat))
-                        value = stored_value(physical_done[key]) if key in physical_done else (TIMEOUT_MS, 0, True, warm[3], "warm-up timed out; repeat skipped", "", "")
+                        value = stored_value(physical_done[key]) if key in physical_done else (TIMEOUT_MS, 0, True, warm[3], "warm-up timed out; repeat skipped", "", "", "", "", "", "")
                         append_group(writer, group, repeat, "skipped_after_warmup_timeout", value, owner); f.flush()
 
             for repeat in range(1, max((group["repeat_count"] for group in group_list), default=r) + 1):
@@ -727,7 +755,9 @@ def main():
                         value = stored_value(physical_done[key])
                     else:
                         value = execution(conn, group["variants"][owner]["statement"])
-                        physical_done[key] = {"exec_ms": value[0], "wall_ms": value[1], "timeout": str(value[2]), "hint_used": str(value[3]), "error": value[4], "shared_hit_blocks": value[5], "shared_read_blocks": value[6], "hint_reused": "false"}
+                        physical_done[key] = {"exec_ms": value[0], "wall_ms": value[1], "timeout": str(value[2]), "hint_used": str(value[3]), "error": value[4],
+                                              **dict(zip(("shared_hit_blocks", "shared_read_blocks", "shared_dirtied_blocks", "shared_written_blocks", "temp_read_blocks", "temp_written_blocks"), value[5:11])),
+                                              "buffer_parser_version": BUFFER_COUNTER_VERSION, "hint_reused": "false"}
                     append_group(writer, group, repeat, "measured", value, owner); f.flush()
 
         metadata["timestamps_utc"]["evaluation_finished"] = datetime.now(timezone.utc).isoformat()
